@@ -1,0 +1,2 @@
+- [EXP-001a] 2026-09-01 | 口径 | 手写基线在 pin SHA 43f532c 可测得稳定数字，作为本仓锚点 | CI experiment job：ramen_space_bench 手写策略 300 局（采样空间=教师采集同构），输出均分/标准误/达标率；与旧锚点 65445 对比只作参考不裁决（跨 commit 不可比，§0.2） | 待跑 | 产出 = 本仓正式锚点，写回 LEDGER 新条目；此后一切实验以它为对照 | **修订 EXP-001**：旧管线 checkpoint 不可得（用户 2026-09-01 确认），集成复现取消；上游引用改为 SHA pin 43f532c（UPSTREAM.md），CI 由 floating ref 改 pin
+- [EXP-001 修订] 2026-09-01 | 口径 | （见 EXP-001a） | 原计划"复现旧锚点+top6"降级为"新建本仓锚点" | — | 旧锚点表保留于 PRINCIPLES §5 作历史参考，标注"未绑 commit，仅参考" | 用户裁定 + UPSTREAM.md pin 规则
