@@ -10,22 +10,26 @@ on:
   workflow_dispatch:
     inputs:
       experiment:
-        description: "实验 ID（如 EXP-001）；空 = 只跑冒烟"
+        description: "实验 ID（如 EXP-001a）；空 = 只跑冒烟"
         required: false
         default: ""
+
+env:
+  # 上游 pin 白名单（experiments/UPSTREAM.md）——改 pin 必须先改那里并走账本
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: 43f532c599d8591f16b1fcdd2e301ebff858d511
 
 jobs:
   smoke:
     # 准则 §1 三步验证第 1 步：任何实验先冒烟
-    # 门禁 = 编译 + Python 测试 + CLI 入口。上游 Rust 全套测试不进门禁
-    # （见 upstream-suite job 注释），我们的验收是闭环基准（准则 §0.1）
+    # 门禁 = 编译 + Python 测试 + CLI 入口；验收口径是闭环基准（准则 §0.1）
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: muxueliunian/umaai-rs-muxue
-          ref: feat/ramen-nn-schema
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
 
       - uses: actions/checkout@v4
         with:
@@ -51,17 +55,14 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # 上游 requirements.txt 不含 pytest（实测 9677b2a9 卡此：
-      # numpy/torch/onnx/onnxruntime 四行而已）；torch 显式走 CPU index——
-      # 免费 runner 无 GPU，模型也用不上 CUDA
+      # 上游 requirements.txt 不含 pytest（实测 9677b2a9 卡此）；
+      # torch 显式走 CPU index——免费 runner 无 GPU，模型也用不上 CUDA
       - name: Install python deps
         run: |
           pip install pytest
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r scripts/ramen_nn/requirements.txt
 
-      # gamedata 下载（主仓 build.yml 实证源：xulai1001/umaai-rs master raw）。
-      # 上游仓 gamedata 不入库；冒烟只要求编译与 Python 测试，下载失败不拦门禁
       - name: Download gamedata (best effort)
         run: |
           mkdir -p gamedata
@@ -99,10 +100,8 @@ jobs:
             cli_args.txt
           retention-days: 14
 
-  # 上游 Rust 全套测试：信息性，不进门禁（首次 CI 实锤 2 处坑：
-  # ① 测试断言精确基线值，绑定上游本地 gamedata——我们拉 master raw gamedata
-  #   会因数据漂移假红；② debug profile 跑 330 个整局测试，60min 冒烟窗放不下）。
-  # 我们的质量门禁是闭环基准（准则 §0.1），不是上游测试套件。
+  # 上游 Rust 全套测试：信息性，不进门禁（实测 2 处坑：逐位断言绑上游本地
+  # gamedata 会因数据漂移假红；debug profile 330 整局测试超冒烟窗）
   upstream-suite:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -111,8 +110,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: muxueliunian/umaai-rs-muxue
-          ref: feat/ramen-nn-schema
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: actions/cache@v4
@@ -133,7 +132,8 @@ jobs:
       - name: Full test suite (informational)
         run: cargo test -p umasim --lib 2>&1 | tail -100
 
-  # 正式实验 job：workflow_dispatch 带 experiment ID 触发，准则 §4 时限 6h
+  # 正式实验 job：dispatch 带 experiment ID，执行该实验目录下的 run.sh
+  # （准则 §3：先写 plan 再跑；run.sh 是实验自己的协议，CI 不硬编码任何实验）
   experiment:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.experiment != ''
     needs: smoke
@@ -142,11 +142,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: muxueliunian/umaai-rs-muxue
-          ref: feat/ramen-nn-schema
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+
       - uses: actions/checkout@v4
         with:
           path: lab
+
+      - name: Verify upstream pin (准则 §0.5 / UPSTREAM.md)
+        run: |
+          GOT=$(git rev-parse HEAD)
+          echo "checked out $GOT"
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT 不在 UPSTREAM.md 白名单"; exit 1; }
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -180,30 +187,13 @@ jobs:
             curl -sSL "$BASE/$f" -o "gamedata/$f" || exit 1
           done
 
-      # 教师数据采集 → 导出 → 标签 → 训练 → ONNX 导出
-      # 精确参数以 experiments/<ID>/plan.md 为准（准则 §3 先写后跑）；
-      # smoke job 的 cli_args.txt artifact 是参数回填源
-      - name: Collect teacher data (配额补稀疏阶段, 准则 §2)
-        run: |
-          cargo run --release -p umasim --bin ramen_teacher_collect -- \
-            --count 200 --start 0 --out training_data/ci_run || echo "COLLECT_PARAMS_NEED_PLAN_MD"
-      - name: Export npy (禁 --raw, 准则 §1.2)
-        run: cargo run --release -p umasim --bin ramen_export_npy -- --input training_data/ci_run --output training_data/npy_ci
-      - name: Labels
-        run: python scripts/ramen_nn/labels.py --input training_data/npy_ci --output training_data/labels_ci
-      - name: Train (嵌套抽稀断点续训, 准则 §4)
-        run: python scripts/ramen_nn/train.py --data training_data/npy_ci --labels training_data/labels_ci --output-dir saved_models/ci
-      - name: Export ONNX (opset13 + 白名单 + 对拍 <1e-4, 准则 §4)
-        run: python scripts/ramen_nn/export_onnx.py --checkpoint saved_models/ci/best.pt --output saved_models/ci/model.onnx
+      - name: Run experiment script
+        run: bash "lab/experiments/${{ github.event.inputs.experiment }}/run.sh"
 
-      # 实验产物：只保留 model.onnx + 元数据 + 指标（准则 §4），.npy 用完即弃
-      - name: Upload artifacts
+      - name: Upload experiment artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.experiment }}-artifacts
-          path: |
-            saved_models/ci/model.onnx
-            saved_models/ci/model.onnx.json
-            saved_models/ci/run.json
-            saved_models/ci/metrics.jsonl
-          retention-days: 14
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
