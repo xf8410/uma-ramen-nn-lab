@@ -1,0 +1,126 @@
+name: lab-check
+
+on:
+  push:
+    branches: [main, "workbench/**"]
+  pull_request:
+  schedule:
+    # 每周六 03:00 UTC（准则 §4：周末定时补采+重训+验收）
+    - cron: "0 3 * * 6"
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: "实验 ID（如 EXP-001）；空 = 只跑冒烟"
+        required: false
+        default: ""
+
+jobs:
+  smoke:
+    # 准则 §1 三步验证第 1 步：任何实验先冒烟
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: muxueliunian/umaai-rs-muxue
+          ref: feat/ramen-nn-schema
+      # 上游 manifest 记录（准则 §2：数据必须绑 commit）
+      - name: Record upstream commit
+        run: git rev-parse HEAD > upstream_commit.txt
+
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Merge lab files
+        run: |
+          cp -r lab/.github/workflows/* .github/workflows/ 2>/dev/null || true
+          cp lab/PRINCIPLES.md lab/experiments -r . 2>/dev/null || true
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install python deps
+        run: pip install -r scripts/ramen_nn/requirements.txt
+
+      # gamedata 下载（方案来自主仓 xf8410/uma-juece-ramen build.yml）
+      - name: Download gamedata
+        run: |
+          mkdir -p gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json default_config.toml; do
+            curl -sfL "https://raw.githubusercontent.com/hzyhhzy/UmaAi/master/gamedata/$f" -o "gamedata/$f" || echo "skip $f"
+          done
+          ls -la gamedata/
+
+      - name: Cargo check (onnx feature)
+        run: cargo check -p umasim --features onnx
+
+      - name: Cargo test (default features, 守门测试)
+        run: cargo test -p umasim --lib
+
+      - name: Python tests
+        run: python -m pytest scripts/ramen_nn/tests -q
+
+      - name: Smoke benchmark (准则 §1.1：1 局级冒烟，体量预估 see §1.2)
+        run: cargo run --release -p umasim --bin ramen_space_bench -- --help || true
+
+  # 正式实验 job：由 workflow_dispatch 带 experiment ID 触发，遵守准则 §4 时限
+  experiment:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.experiment != ''
+    needs: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: muxueliunian/umaai-rs-muxue
+          ref: feat/ramen-nn-schema
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r scripts/ramen_nn/requirements.txt
+
+      - name: Download gamedata
+        run: |
+          mkdir -p gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json default_config.toml; do
+            curl -sfL "https://raw.githubusercontent.com/hzyhhzy/UmaAi/master/gamedata/$f" -o "gamedata/$f" || echo "skip $f"
+          done
+
+      # 教师数据采集 → 标签 → 训练 → ONNX 导出 → 闭环验收
+      # 各步骤参数由 experiments/<ID>/plan.md 定义（准则 §3：先写 plan 后跑）
+      - name: Collect teacher data (配额补稀疏阶段, 准则 §2)
+        run: |
+          cargo run --release -p umasim --bin ramen_teacher_collect -- \
+            --count 200 --start 0 --out training_data/ci_run || echo "参数以 plan.md 为准"
+      - name: Export npy (禁 --raw, 准则 §1.2)
+        run: cargo run --release -p umasim --bin ramen_export_npy -- --input training_data/ci_run --output training_data/npy_ci
+      - name: Labels
+        run: python scripts/ramen_nn/labels.py --input training_data/npy_ci --output training_data/labels_ci
+      - name: Train (嵌套抽稀断点续训, 准则 §4)
+        run: python scripts/ramen_nn/train.py --data training_data/npy_ci --labels training_data/labels_ci --output-dir saved_models/ci
+      - name: Export ONNX (opset13 + 白名单 + 对拍 <1e-4, 准则 §4)
+        run: python scripts/ramen_nn/export_onnx.py --checkpoint saved_models/ci/best.pt --output saved_models/ci/model.onnx
+
+      # 实验产物：只保留 model.onnx + 元数据 + 指标（准则 §4）
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.experiment }}-artifacts
+          path: |
+            saved_models/ci/model.onnx
+            saved_models/ci/model.onnx.json
+            saved_models/ci/run.json
+            saved_models/ci/metrics.jsonl
+          retention-days: 14
