@@ -24,50 +24,70 @@ jobs:
         with:
           repository: muxueliunian/umaai-rs-muxue
           ref: feat/ramen-nn-schema
-      # 上游 manifest 记录（准则 §2：数据必须绑 commit）
-      - name: Record upstream commit
-        run: git rev-parse HEAD > upstream_commit.txt
 
       - uses: actions/checkout@v4
         with:
           path: lab
-      - name: Merge lab files
-        run: |
-          cp -r lab/.github/workflows/* .github/workflows/ 2>/dev/null || true
-          cp lab/PRINCIPLES.md lab/experiments -r . 2>/dev/null || true
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Merge lab files (PRINCIPLES/LEDGER 留档到 artifact)
+        run: mkdir -p lab_docs && cp lab/PRINCIPLES.md lab/README.md lab_docs/ && cp -r lab/experiments lab_docs/
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
         with:
-          toolchain: stable
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-smoke-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: lab-smoke-${{ runner.os }}-
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
+
       - name: Install python deps
         run: pip install -r scripts/ramen_nn/requirements.txt
 
-      # gamedata 下载（方案来自主仓 xf8410/uma-juece-ramen build.yml）
+      # gamedata 下载：复用主仓 build.yml 实证的 xulai1001/umaai-rs master raw
+      # （首次 CI 实测 hzyhhzy/UmaAi 无此目录，全部 skip——上游 muxue 仓 gamedata
+      #   同样不入库，靠此下载）
       - name: Download gamedata
         run: |
           mkdir -p gamedata
-          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json default_config.toml; do
-            curl -sfL "https://raw.githubusercontent.com/hzyhhzy/UmaAi/master/gamedata/$f" -o "gamedata/$f" || echo "skip $f"
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl -sSL "$BASE/$f" -o "gamedata/$f" || echo "WARN: $f"
           done
           ls -la gamedata/
 
+      # 注意：上游分支在 `-D warnings`（setup-rust-toolchain 默认注入）下
+      # onnx feature 有 3 处 dead_code（leaf_nn/simulate_until_terminal_or_leaf/
+      # SimOutcome，均为 E4/E6 预留接口）——首次 CI 实锤。dtolnay 不注入
+      # RUSTFLAGS，走上游自己的验收口径
       - name: Cargo check (onnx feature)
         run: cargo check -p umasim --features onnx
 
-      - name: Cargo test (default features, 守门测试)
+      - name: Cargo test (守门测试全量)
         run: cargo test -p umasim --lib
 
       - name: Python tests
         run: python -m pytest scripts/ramen_nn/tests -q
 
-      - name: Smoke benchmark (准则 §1.1：1 局级冒烟，体量预估 see §1.2)
-        run: cargo run --release -p umasim --bin ramen_space_bench -- --help || true
+      - name: Smoke benchmark CLI (准则 §1.1：入口可跑即过)
+        run: cargo run --release -p umasim --bin ramen_space_bench -- --help
 
-  # 正式实验 job：由 workflow_dispatch 带 experiment ID 触发，遵守准则 §4 时限
+      - name: Upload lab docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-docs
+          path: lab_docs
+          retention-days: 14
+
+  # 正式实验 job：workflow_dispatch 带 experiment ID 触发，准则 §4 时限 6h
   experiment:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.experiment != ''
     needs: smoke
@@ -82,9 +102,20 @@ jobs:
         with:
           path: lab
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
         with:
-          toolchain: stable
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp-${{ runner.os }}-
+            lab-smoke-${{ runner.os }}-
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -94,16 +125,17 @@ jobs:
       - name: Download gamedata
         run: |
           mkdir -p gamedata
-          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json default_config.toml; do
-            curl -sfL "https://raw.githubusercontent.com/hzyhhzy/UmaAi/master/gamedata/$f" -o "gamedata/$f" || echo "skip $f"
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl -sSL "$BASE/$f" -o "gamedata/$f" || echo "WARN: $f"
           done
 
-      # 教师数据采集 → 标签 → 训练 → ONNX 导出 → 闭环验收
+      # 教师数据采集 → 导出 → 标签 → 训练 → ONNX 导出
       # 各步骤参数由 experiments/<ID>/plan.md 定义（准则 §3：先写 plan 后跑）
       - name: Collect teacher data (配额补稀疏阶段, 准则 §2)
         run: |
           cargo run --release -p umasim --bin ramen_teacher_collect -- \
-            --count 200 --start 0 --out training_data/ci_run || echo "参数以 plan.md 为准"
+            --count 200 --start 0 --out training_data/ci_run || echo "COLLECT_PARAMS_NEED_PLAN_MD"
       - name: Export npy (禁 --raw, 准则 §1.2)
         run: cargo run --release -p umasim --bin ramen_export_npy -- --input training_data/ci_run --output training_data/npy_ci
       - name: Labels
@@ -113,7 +145,7 @@ jobs:
       - name: Export ONNX (opset13 + 白名单 + 对拍 <1e-4, 准则 §4)
         run: python scripts/ramen_nn/export_onnx.py --checkpoint saved_models/ci/best.pt --output saved_models/ci/model.onnx
 
-      # 实验产物：只保留 model.onnx + 元数据 + 指标（准则 §4）
+      # 实验产物：只保留 model.onnx + 元数据 + 指标（准则 §4），.npy 用完即弃
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
