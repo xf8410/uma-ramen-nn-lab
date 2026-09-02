@@ -1,0 +1,145 @@
+name: EXP-004 Rust 闭环验收（矩阵）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: 43f532c599d8591f16b1fcdd2e301ebff858d511
+  EXP003_RUN_ID: "33588447596"
+
+jobs:
+  # 4 组并行：手写对照 + 3 个 NN 种子；同 525 计划 / 同 seed 基 / runs_per_plan=8（4200 局/组）
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: handwritten
+            trainer: handwritten
+          - { id: nn-seed20260830, trainer: nn, seed: "20260830" }
+          - { id: nn-seed20260831, trainer: nn, seed: "20260831" }
+          - { id: nn-seed20260832, trainer: nn, seed: "20260832" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp-${{ runner.os }}-
+            lab-smoke-${{ runner.os }}-
+      - name: Download gamedata (必需)
+        run: |
+          mkdir -p gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl -sSL "$BASE/$f" -o "gamedata/$f" || exit 1
+          done
+      - name: Download model (NN 组)
+        if: matrix.trainer == 'nn'
+        uses: actions/download-artifact@v4
+        with:
+          name: EXP-003-model-seed${{ matrix.seed }}
+          path: models/seed${{ matrix.seed }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.EXP003_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: Build bench（feature onnx，4 组共用同一二进制口径）
+        run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
+      - name: Run bench (${{ matrix.id }})
+        run: |
+          mkdir -p experiment_output
+          ARGS="--runs-per-plan 8 --seed 61444 --csv experiment_output/exp004_${{ matrix.id }}.csv"
+          if [ "${{ matrix.trainer }}" = "nn" ]; then
+            ./target/release/ramen_space_bench --trainer nn \
+              --model "models/seed${{ matrix.seed }}/model.onnx" $ARGS 2>&1 | tail -45
+          else
+            ./target/release/ramen_space_bench --trainer handwritten $ARGS 2>&1 | tail -45
+          fi
+      - name: Upload bench artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-004-${{ matrix.id }}
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  # 配对裁决：同 (计划, 局) 共享规则种子流（rule_master 与策略无关）→ CSV 行序配对
+  summary:
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-004-*
+          path: downloaded
+          merge-multiple: false
+      - name: 配对分析（§0.4：t>2 才判 NN 超手写）
+        run: |
+          python3 - <<'PY'
+          import csv, glob, math, os
+
+          def load(path):
+              with open(path, newline="") as f:
+                  rows = list(csv.DictReader(f))
+              return rows
+
+          hw_rows = load(glob.glob("downloaded/EXP-004-handwritten/**/exp004_handwritten.csv", recursive=True)[0])
+          hw = [float(r["score"]) for r in hw_rows]
+          hw_seeds = [r["seed"] for r in hw_rows]
+          hw_fail = sum(r["free_race_ok"] == "0" for r in hw_rows)
+          n = len(hw)
+          hw_mean = sum(hw) / n
+          hw_sd = (sum((x - hw_mean) ** 2 for x in hw) / (n - 1)) ** 0.5
+          print(f"handwritten: n={n} mean={hw_mean:.1f} sd={hw_sd:.1f} se={hw_sd / math.sqrt(n):.1f} 自选未达标={hw_fail}")
+
+          summary = []
+          for path in sorted(glob.glob("downloaded/EXP-004-nn-seed*/**/exp004_nn-*.csv", recursive=True)):
+              tag = os.path.basename(path).replace("exp004_", "").replace(".csv", "")
+              rows = load(path)
+              assert len(rows) == n, f"{tag}: 行数 {len(rows)} != 手写 {n}"
+              seeds = [r["seed"] for r in rows]
+              assert seeds == hw_seeds, f"{tag}: seed 列与手写不逐行一致，配对失效"
+              scores = [float(r["score"]) for r in rows]
+              diffs = [a - b for a, b in zip(scores, hw)]
+              d_mean = sum(diffs) / n
+              d_sd = (sum((x - d_mean) ** 2 for x in diffs) / (n - 1)) ** 0.5
+              t = d_mean / (d_sd / math.sqrt(n))
+              fail = sum(r["free_race_ok"] == "0" for r in rows)
+              nn_mean = sum(scores) / n
+              verdict = "NN 超手写 ✅" if (t > 2 and d_mean > 0) else "未超过"
+              print(f"{tag}: mean={nn_mean:.1f} Δ={d_mean:+.1f} sd(d)={d_sd:.1f} t={t:+.2f} 自选未达标={fail} → {verdict}")
+              summary.append((tag, nn_mean, d_mean, t, fail, verdict))
+
+          print(f"\nANCHOR-003 参考：64958 ± 137.7（runs_per_plan=1 口径）")
+          print(f"本次手写对照（runs_per_plan=8）：{hw_mean:.1f}")
+          print("判据（准则 §0.4）：配对 t > 2 且 Δ>0 才判 NN 超手写；否则如实记未超过")
+          with open("SUMMARY.txt", "w") as f:
+              f.write(f"handwritten mean={hw_mean:.1f}\n")
+              for tag, m, d, t, fail, v in summary:
+                  f.write(f"{tag}: mean={m:.1f} d={d:+.1f} t={t:+.2f} fail={fail} {v}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-004-summary
+          path: SUMMARY.txt
+          retention-days: 30
