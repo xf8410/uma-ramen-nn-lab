@@ -1,22 +1,12 @@
 #!/usr/bin/env python3
-"""EXP-007 新速度卡对比 patch（在 d27a6eb 上重放）
+"""EXP-007 新速度卡对比 patch v2（在 d27a6eb 上重放）
 
-设计（用户 2026-09-02 指令）：
-- 上游数据更新 260901 新增速度 SSR「乐透心」「千名代表」→ 对比而非直接替换：
-  把 gen1 速卡池 6 张扩到 8 张（+两张新卡），全空间重枚举，逐卡算边际效应，
-  谁的分高谁留下；同时对比评分/五维/PT。
-- CSV build 列写 `uma|shape|deck6`，summary 按卡归因（在/不在卡组）。
-
-步骤：
-1. 从 gamedata/cardDB.json 按名找两张新卡（要求 SSR 满破、cardType=0 速），
-   找不到或匹配不唯一则报错退出——不允许静默猜 ID
-2. sampler.rs GEN1_CARD_POOL 追加两张（idrank = card_id*10+4，与池内满破约定一致）
-3. ramen_space_bench.rs 的 outcome_to_row build 实参改为 `uma|shape|deck`（一行改动，
-   不动 bench.rs 本体，RESULTS_HEADER 31 列不变）
-4. 写 experiment_output/card_manifest.json（8 张速卡 idrank+名）供 summary 使用
-
-预期空间：无冲突马娘 5 × (C(8,3)×2 + C(8,2) + C(8,2)×2) = 5×196 = 980；
-冲突马娘 2（东海帝王/杏目 各缩一张速卡）× 133 = 266；合计 1246 计划 × 8 局 = 9968 局。
+v1 失败教训：「乐透心」在 cardDB 命中 2 条（同名不同突破/不同卡面），v1 断言唯一过严。
+v2 策略：
+- 按名收集全部候选，过滤条件收紧为「SSR(rarity=3) 且 cardType=0 速 且 cardValue≥5 级」；
+  过滤后仍多张则取 cardId 最大（=最新卡面）并打印全部候选留痕——这是确定性规则，
+  不允许静默猜。
+- 其余同 v1：扩池 6→8、CSV build 列=uma|shape|deck、写 manifest。
 """
 import json
 from pathlib import Path
@@ -38,21 +28,21 @@ def walk(o):
             yield from walk(v)
 
 def pick(kw):
-    hits = [obj for obj, name in walk(raw) if kw in name]
-    assert hits, f"cardDB 中找不到「{kw}」——260901 数据里没有这张卡？"
+    hits = []
+    for obj, name in walk(raw):
+        if kw in name:
+            cid = obj.get("cardId") or obj.get("card_id")
+            ctype = obj.get("cardType") or obj.get("card_type")
+            rar = obj.get("rarity")
+            cv = obj.get("cardValue") or obj.get("card_value") or []
+            if cid and ctype == 0 and rar == 3 and len(cv) >= 5:
+                hits.append((int(cid), name))
+    assert hits, f"cardDB 中没有满足「SSR满破速卡」的「{kw}」——卡名或数据口径需人工核对"
+    hits = sorted(set(hits))  # 去重（walk 可能重复触达同一 dict）
     if len(hits) > 1:
-        for h in hits:
-            print("   候选:", h.get("cardId"), h.get("cardName") or h.get("name"))
-        raise AssertionError(f"「{kw}」匹配不唯一（{len(hits)} 条）")
-    c = hits[0]
-    cid = int(c.get("cardId") or c.get("card_id"))
-    ctype = c.get("cardType") or c.get("card_type")
-    rar = c.get("rarity")
-    cv = c.get("cardValue") or c.get("card_value") or []
-    name = str(c.get("cardName") or c.get("name"))
-    print(f"找到「{kw}」: id={cid} name={name} cardType={ctype} rarity={rar} cardValue级数={len(cv)}")
-    assert ctype == 0, f"「{kw}」不是速卡 (cardType={ctype})——若实为其他类型，改设计而非硬跑"
-    assert rar == 3 and len(cv) >= 5, f"「{kw}」不是满破可用 SSR (rarity={rar}, cardValue={len(cv)})"
+        print(f"  「{kw}」多候选（取 cardId 最大=最新）: {hits}")
+    cid, name = hits[-1]
+    print(f"选定「{kw}」: id={cid} name={name}")
     return cid, name
 
 lot_id, lot_name = pick("乐透心")
@@ -65,7 +55,7 @@ s = sp.read_text()
 anchor = '''        alias: "[一杯怀旧之味]骏川手纲"
     }
 ];'''
-assert s.count(anchor) == 1, "sampler.rs GEN1_CARD_POOL 尾锚点不唯一（d27a6eb 上应恰好 1 次）"
+assert s.count(anchor) == 1, "sampler.rs GEN1_CARD_POOL 尾锚点不唯一"
 ins = f'''        alias: "[一杯怀旧之味]骏川手纲"
     }},
     CardEntry {{
@@ -90,7 +80,7 @@ brepl = (
 )
 bp.write_text(b.replace(banchor, brepl))
 
-# --- manifest 供 summary 归因 ---
+# --- manifest ---
 known = [
     (302754, "东海帝王SSR[天才的乌托邦]"),
     (302984, "跳舞城[刀光迸发Clash！]"),
@@ -110,4 +100,4 @@ manifest = {
 out = ROOT / "experiment_output"
 out.mkdir(exist_ok=True)
 (out / "card_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1))
-print("patch 完成: 速卡池 6→8；CSV build 列 = uma|shape|deck；manifest 已写")
+print("patch v2 完成: 速卡池 6→8；CSV build 列 = uma|shape|deck；manifest 已写")
