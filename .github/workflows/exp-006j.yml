@@ -1,0 +1,145 @@
+name: EXP-006j 第二年补短板继续上行（3.5/4.0/4.5）× Y3 复测（1.4/1.9 @g232）× 近上限衰减在新冠军上重测（10 变体 × 4200 局）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, g2320-g3160-cook60, g2350-g3160-cook60, g2400-g3160-cook60, g2450-g3160-cook60, g2320-g3140-cook60, g2320-g3190-cook60, o3100-g2320-g3160-cook60, o3150-g2320-g3160-cook60, o2150-o3150-g2320-g3160-cook60]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply EXP-006c + 006d + 006e + fix patches（全链）
+        run: |
+          python3 lab/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e_fix.py
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp006j-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp006j-${{ runner.os }}-
+            lab-exp006i-${{ runner.os }}-
+      - name: Build bench
+        run: cargo build --release -p umasim --bin ramen_space_bench
+      - name: Run bench (variant=${{ matrix.variant }})
+        run: |
+          mkdir -p experiment_output
+          ./target/release/ramen_space_bench --trainer handwritten \
+            --variant ${{ matrix.variant }} \
+            --runs-per-plan 8 --seed 61444 \
+            --csv experiment_output/exp006j_${{ matrix.variant }}.csv 2>&1 | tail -45
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-006j-${{ matrix.variant }}
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  summary:
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-006j-*
+          path: downloaded
+          merge-multiple: false
+      - name: 配对裁决（全列：均分/Δ/t/PT/五维/RMJ/吃面）
+        run: |
+          python3 - <<'PY'
+          import csv, glob, math
+
+          VARIANTS = ["base", "g2320-g3160-cook60", "g2350-g3160-cook60", "g2400-g3160-cook60",
+                      "g2450-g3160-cook60", "g2320-g3140-cook60", "g2320-g3190-cook60",
+                      "o3100-g2320-g3160-cook60", "o3150-g2320-g3160-cook60",
+                      "o2150-o3150-g2320-g3160-cook60"]
+          FIVE = ["speed", "stamina", "power", "guts", "wisdom"]
+
+          def load(v):
+              hits = glob.glob(f"downloaded/EXP-006j-{v}/**/exp006j_{v}.csv", recursive=True)
+              assert hits, f"缺 {v} 的 CSV"
+              return list(csv.DictReader(open(hits[0], newline="")))
+
+          base = load("base")
+          n = len(base)
+          b_scores = [float(r["score"]) for r in base]
+          b_mean = sum(b_scores) / n
+          b_se = (sum((x - b_mean) ** 2 for x in b_scores) / (n - 1)) ** 0.5 / math.sqrt(n)
+          seeds = [r["seed"] for r in base]
+
+          PIN, PIN_SE = 65438.2, 54.5
+          print(f"base: n={n} mean={b_mean:.1f} se={b_se:.1f}  | pin {PIN}±{PIN_SE}  偏差 {b_mean-PIN:+.1f}")
+          assert abs(b_mean - PIN) < 4 * PIN_SE, f"BASE DRIFT: {b_mean} vs {PIN}"
+
+          print(f"\n{'变体':<30} {'均分':>8} {'Δ配对':>8} {'t':>7} {'PT':>6} | {'速':>5} {'耐':>5} {'力':>5} {'根':>5} {'智':>5} | {'RMJ':>5} {'吃面':>5}  判定")
+          rows_out = []
+          for v in VARIANTS:
+              rows = base if v == "base" else load(v)
+              assert [r["seed"] for r in rows] == seeds, f"{v}: seed 流不一致"
+              s = [float(r["score"]) for r in rows]
+              diffs = [a - b for a, b in zip(s, b_scores)]
+              d = sum(diffs) / n
+              sd = (sum((x - d) ** 2 for x in diffs) / (n - 1)) ** 0.5
+              t = d / (sd / math.sqrt(n)) if sd > 0 else 0.0
+              m = sum(s) / n
+              pt = sum(int(r["skill_pt"]) for r in rows) / n
+              fs = [sum(int(r[c]) for r in rows) / n for c in FIVE]
+              rmj = sum(int(r["rmj_ok"]) for r in rows) / n
+              et = sum(sum(int(r[f"eat_count_y{y+1}"]) for y in range(3)) for r in rows) / n
+              verdict = "（对照）" if v == "base" else ("采纳 ✅" if (t > 2 and d > 0) else "未超")
+              print(f"{v:<30} {m:>8.1f} {d:>+8.1f} {t:>+7.2f} {pt:>6.0f} | "
+                    f"{fs[0]:>5.0f} {fs[1]:>5.0f} {fs[2]:>5.0f} {fs[3]:>5.0f} {fs[4]:>5.0f} | "
+                    f"{rmj:>5.2f} {et:>5.1f}  {verdict}")
+              rows_out.append((v, m, d, t, pt, fs, rmj, et, verdict))
+
+          winners = [r for r in rows_out if r[8] == "采纳 ✅"]
+          print(f"\n采纳数：{len(winners)}/{len(VARIANTS)-1}")
+          if winners:
+              best = max(winners, key=lambda r: r[2])
+              print(f"最优候选：{best[0]}（Δ={best[2]:+.1f}, t={best[3]:+.2f}）")
+              ref = next((r for r in rows_out if r[0] == "g2320-g3160-cook60"), None)
+              if ref:
+                  print(f"carry g2320-g3160-cook60 本轮 Δ={ref[2]:+.1f}（006i 口径 +109.4，同种子应逐位复现）")
+              g2s = [(r[0].split("-")[0], r[2]) for r in rows_out if r[0].startswith("g23") or r[0].startswith("g24")]
+              print("Y2 上行趋势: " + "  ".join(f"{v}={d:+.1f}" for v, d in sorted(set(g2s))))
+          else:
+              print("全负")
+          with open("SUMMARY.txt", "w") as f:
+              f.write(f"base mean={b_mean:.1f}\n")
+              for r in rows_out:
+                  f.write(f"{r[0]}: mean={r[1]:.1f} d={r[2]:+.1f} t={r[3]:+.2f} pt={r[4]:.0f} "
+                          f"five={[round(x) for x in r[5]]} rmj={r[6]:.2f} eat={r[7]:.1f} {r[8]}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-006j-summary
+          path: SUMMARY.txt
+          retention-days: 30
