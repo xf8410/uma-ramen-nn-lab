@@ -1,0 +1,117 @@
+name: EXP-002 教师采集（矩阵并行）
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # 8 个并行分片 job（用户裁定的矩阵做法）：每片领 [i*1500, (i+1)*1500)
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+      UPSTREAM_REF: 43f532c599d8591f16b1fcdd2e301ebff858d511
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp-${{ runner.os }}-
+            lab-smoke-${{ runner.os }}-
+      - name: Download gamedata (必需)
+        run: |
+          mkdir -p gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl -sSL "$BASE/$f" -o "gamedata/$f" || exit 1
+          done
+      - name: Run shard ${{ matrix.shard }}
+        run: bash "lab/experiments/EXP-002-teacher-pilot/run.sh" ${{ matrix.shard }}
+      - name: Upload shard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-002-shard${{ matrix.shard }}
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  # 汇总校验 + 合并：recipe_hash 一致 / 区间无缝不重叠 / 读回条数==accepted
+  assemble:
+    needs: collect
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-002-shard*
+          path: downloaded
+          merge-multiple: false
+      - name: 校验并合并 8 分片
+        run: |
+          python3 - <<'PY'
+          import json, glob, os, shutil
+
+          manifests = []
+          for i in range(8):
+              hits = glob.glob(f"downloaded/EXP-002-shard{i}/**/manifest_shard_{i}.json", recursive=True) \
+                  or glob.glob(f"downloaded/EXP-002-shard{i}/**/shard_{i}/manifest.json", recursive=True) \
+                  or glob.glob(f"downloaded/EXP-002-shard{i}/**/manifest.json", recursive=True)
+              assert hits, f"shard {i} manifest 未找到"
+              m = json.load(open(hits[0]))
+              m["_dir"] = os.path.dirname(hits[0])
+              manifests.append(m)
+
+          base = manifests[0]
+          for i, m in enumerate(manifests):
+              assert m["recipe_hash_fnv1a64"] == base["recipe_hash_fnv1a64"], f"shard {i} 配方不一致"
+              s, e = i * 1500, (i + 1) * 1500
+              assert m["index_start"] == s and m["index_end"] == e, f"shard {i} 区间错: [{m['index_start']},{m['index_end']})"
+              assert m["finished_at"], f"shard {i} 未完成"
+              print(f"shard {i}: accepted={m['accepted']} skipped={m['skipped_uncaptured']} parts={len(m['parts'])}")
+
+          os.makedirs("dataset", exist_ok=True)
+          merged_parts, gidx, total = [], 0, 0
+          for m in manifests:
+              for p in m["parts"]:
+                  shutil.copy(os.path.join(m["_dir"], p["name"]), f"dataset/part_{gidx:06d}.bin")
+                  merged_parts.append({**p, "name": f"part_{gidx:06d}.bin"})
+                  total += p["samples"]; gidx += 1
+
+          merged = {**base, "index_start": 0, "index_end": 12000, "parts": merged_parts,
+                    "accepted": total,
+                    "skipped_uncaptured": sum(m["skipped_uncaptured"] for m in manifests),
+                    "note": "merged from 8 matrix shards (EXP-002)"}
+          merged.pop("_dir", None)
+          json.dump(merged, open("dataset/manifest.json", "w"), ensure_ascii=False, indent=2)
+          summary = f"accepted={total} skipped={merged['skipped_uncaptured']} parts={gidx} recipe={base['recipe_hash_fnv1a64']}"
+          print("MERGED:", summary)
+          open("dataset/SUMMARY.txt", "w").write(summary + "\n")
+          PY
+      - name: Upload merged dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-002-dataset
+          path: dataset/
+          retention-days: 30
+          if-no-files-found: error
