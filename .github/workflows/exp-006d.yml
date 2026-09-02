@@ -1,0 +1,169 @@
+name: EXP-006d RMJ档位前瞻 × 材料预留 × 分年属性补充（12 变体 × 4200 局 + 盘面诊断）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: 43f532c599d8591f16b1fcdd2e301ebff858d511
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, ck20, ck40, cook60, cook80, g280, g2110, g320, g280-g320, g2110-g320, ck20-cook60, ck20-cook80]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply EXP-006c + EXP-006d patches
+        run: |
+          python3 lab/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab/experiments/EXP-006-yearphased/patch_exp006d.py
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp006d-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp006d-${{ runner.os }}-
+            lab-exp006c-${{ runner.os }}-
+      - name: Download gamedata
+        run: |
+          if [ ! -f gamedata/constants.json ]; then
+            mkdir -p gamedata
+            BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
+            for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+              curl -sSL --retry 5 --retry-delay 5 --retry-all-errors "$BASE/$f" -o "gamedata/$f" || exit 1
+            done
+          fi
+      - name: Build bench
+        run: cargo build --release -p umasim --bin ramen_space_bench
+      - name: Run bench (variant=${{ matrix.variant }})
+        run: |
+          mkdir -p experiment_output
+          ./target/release/ramen_space_bench --trainer handwritten \
+            --variant ${{ matrix.variant }} \
+            --runs-per-plan 8 --seed 61444 \
+            --csv experiment_output/exp006d_${{ matrix.variant }}.csv 2>&1 | tail -45
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-006d-${{ matrix.variant }}
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  summary:
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-006d-*
+          path: downloaded
+          merge-multiple: false
+      - name: 配对裁决 + 盘面诊断
+        run: |
+          python3 - <<'PY'
+          import csv, glob, math
+
+          VARIANTS = ["base", "ck20", "ck40", "cook60", "cook80", "g280", "g2110",
+                      "g320", "g280-g320", "g2110-g320", "ck20-cook60", "ck20-cook80"]
+          YEAR_END = [23, 47, 71]
+          RMJ_NEED = [1500, 3000, 5000]  # 第 3 年 3500 成功 / 5000 大成功
+
+          def load(v):
+              hits = glob.glob(f"downloaded/EXP-006d-{v}/**/exp006d_{v}.csv", recursive=True)
+              assert hits, f"缺 {v} 的 CSV"
+              return list(csv.DictReader(open(hits[0], newline="")))
+
+          base = load("base")
+          n = len(base)
+          b_scores = [float(r["score"]) for r in base]
+          b_mean = sum(b_scores) / n
+          b_se = (sum((x - b_mean) ** 2 for x in b_scores) / (n - 1)) ** 0.5 / math.sqrt(n)
+          seeds = [r["seed"] for r in base]
+
+          PIN, PIN_SE = 65438.2, 54.5
+          print(f"base: n={n} mean={b_mean:.1f} se={b_se:.1f}  | pin {PIN}±{PIN_SE}  偏差 {b_mean-PIN:+.1f}")
+          assert abs(b_mean - PIN) < 4 * PIN_SE, f"BASE DRIFT: {b_mean} vs {PIN}"
+
+          # ===== 盘面诊断（对 base，回应"根据训练盘面出判断"）=====
+          print("\n===== 盘面诊断（base，逐年）=====")
+          for y in range(3):
+              key = f"scenario_pt_y{y+1}"
+              pts = [int(r[key]) for r in base]
+              pm = sum(pts) / n
+              over = sum(p - RMJ_NEED[y] for p in pts if p > RMJ_NEED[y]) / n
+              hit = sum(1 for p in pts if (p >= (5000 if y == 2 else RMJ_NEED[y]))) / n * 100
+              great = sum(1 for p in pts if y == 2 and p >= 5000) / n * 100 if y == 2 else float("nan")
+              print(f"Y{y+1}: PT均值 {pm:.0f} / 阈值 {RMJ_NEED[y]}（Y3大成功线5000）  超出量均值 {over:.0f}  达标率 {hit:.1f}%"
+                    + (f"  大成功率 {great:.1f}%" if y == 2 else ""))
+          eat = [sum(int(r[f"eat_count_y{y+1}"]) for y in range(3)) for r in base]
+          print(f"三年吃面次数均值 {sum(eat)/n:.1f}")
+          for y in range(3):
+              ov = [int(r[f"gauge_overflow_y{y+1}"]) for r in base]
+              print(f"Y{y+1} 诀窍溢出均值 {sum(ov)/n:.2f}" + ("  ← 溢出=材料浪费，cook 调高应压这个" if sum(ov) > 0 else ""))
+          # 副属性画像：P90 vs P10 分数组的五维差（只用于解释总分）
+          srt = sorted(base, key=lambda r: int(r["score"]))
+          k = max(1, n // 10)
+          FIVE = ["speed", "stamina", "power", "guts", "wisdom"]
+          lo, hi = srt[:k], srt[-k:]
+          diffs = {a: sum(int(r[a]) for r in hi)/k - sum(int(r[a]) for r in lo)/k for a in FIVE}
+          top = sorted(diffs.items(), key=lambda x: -x[1])
+          print("P90-P10 属性差（提分靠什么）: " + "  ".join(f"{a}+{d:.0f}" for a, d in top))
+
+          # ===== 配对裁决 =====
+          print(f"\n{'变体':<14} {'均分':>8} {'Δ配对':>8} {'t':>7} {'训练PT':>7} {'RMJ':>5} {'吃面':>5} {'溢出Y2':>6}  判定")
+          rows_out = []
+          for v in VARIANTS:
+              rows = base if v == "base" else load(v)
+              assert [r["seed"] for r in rows] == seeds, f"{v}: seed 流不一致"
+              s = [float(r["score"]) for r in rows]
+              diffs = [a - b for a, b in zip(s, b_scores)]
+              d = sum(diffs) / n
+              sd = (sum((x - d) ** 2 for x in diffs) / (n - 1)) ** 0.5
+              t = d / (sd / math.sqrt(n)) if sd > 0 else 0.0
+              pt = sum(int(r["skill_pt"]) for r in rows) / n
+              rmj = sum(int(r["rmj_ok"]) for r in rows) / n
+              et = sum(sum(int(r[f"eat_count_y{y+1}"]) for y in range(3)) for r in rows) / n
+              ov2 = sum(int(r["gauge_overflow_y2"]) for r in rows) / n
+              m = sum(s) / n
+              verdict = "（对照）" if v == "base" else ("采纳 ✅" if (t > 2 and d > 0) else "未超")
+              print(f"{v:<14} {m:>8.1f} {d:>+8.1f} {t:>+7.2f} {pt:>7.0f} {rmj:>5.2f} {et:>5.1f} {ov2:>6.2f}  {verdict}")
+              rows_out.append((v, m, d, t, pt, rmj, verdict))
+
+          winners = [r for r in rows_out if r[6] == "采纳 ✅"]
+          print(f"\n采纳数：{len(winners)}/{len(VARIANTS)-1}")
+          if winners:
+              best = max(winners, key=lambda r: r[2])
+              print(f"最优候选：{best[0]}（Δ={best[2]:+.1f}, t={best[3]:+.2f}）→ 下轮细扫")
+          else:
+              print("全负 → 本轮方向被数据否决，看盘面诊断找下一轮证据")
+          with open("SUMMARY.txt", "w") as f:
+              f.write(f"base mean={b_mean:.1f}\n")
+              for r in rows_out:
+                  f.write(f"{r[0]}: mean={r[1]:.1f} d={r[2]:+.1f} t={r[3]:+.2f} pt={r[4]:.0f} rmj={r[5]:.2f} {r[6]}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-006d-summary
+          path: SUMMARY.txt
+          retention-days: 30
