@@ -1,0 +1,143 @@
+name: EXP-006e power 抑制定价 × g2110 细扫（12 变体 × 4200 局）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, po100, po150, po200, pg-30, pg-60, p2o300, g295, g2130, g2110-cook60, po150-g2110, pg-60-po150-g2110]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply EXP-006c + 006d + 006e patches
+        run: |
+          python3 lab/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e.py
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp006e-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp006e-${{ runner.os }}-
+            lab-sync-260901-${{ runner.os }}-
+      - name: Build bench
+        run: cargo build --release -p umasim --bin ramen_space_bench
+      - name: Run bench (variant=${{ matrix.variant }})
+        run: |
+          mkdir -p experiment_output
+          ./target/release/ramen_space_bench --trainer handwritten \
+            --variant ${{ matrix.variant }} \
+            --runs-per-plan 8 --seed 61444 \
+            --csv experiment_output/exp006e_${{ matrix.variant }}.csv 2>&1 | tail -45
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-006e-${{ matrix.variant }}
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  summary:
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-006e-*
+          path: downloaded
+          merge-multiple: false
+      - name: 配对裁决 + power 专项诊断
+        run: |
+          python3 - <<'PY'
+          import csv, glob, math
+
+          VARIANTS = ["base", "po100", "po150", "po200", "pg-30", "pg-60", "p2o300",
+                      "g295", "g2130", "g2110-cook60", "po150-g2110", "pg-60-po150-g2110"]
+
+          def load(v):
+              hits = glob.glob(f"downloaded/EXP-006e-{v}/**/exp006e_{v}.csv", recursive=True)
+              assert hits, f"缺 {v} 的 CSV"
+              return list(csv.DictReader(open(hits[0], newline="")))
+
+          base = load("base")
+          n = len(base)
+          b_scores = [float(r["score"]) for r in base]
+          b_mean = sum(b_scores) / n
+          b_se = (sum((x - b_mean) ** 2 for x in b_scores) / (n - 1)) ** 0.5 / math.sqrt(n)
+          seeds = [r["seed"] for r in base]
+
+          PIN, PIN_SE = 65438.2, 54.5
+          print(f"base: n={n} mean={b_mean:.1f} se={b_se:.1f}  | pin {PIN}±{PIN_SE}  偏差 {b_mean-PIN:+.1f}")
+          assert abs(b_mean - PIN) < 4 * PIN_SE, f"BASE DRIFT: {b_mean} vs {PIN}"
+
+          FIVE = ["speed", "stamina", "power", "guts", "wisdom"]
+          print("\n===== power 专项诊断（base vs 最优 power 变体）=====")
+          srt = sorted(base, key=lambda r: int(r["score"]))
+          k = max(1, n // 10)
+          lo, hi = srt[:k], srt[-k:]
+          diffs = {a: sum(int(r[a]) for r in hi)/k - sum(int(r[a]) for r in lo)/k for a in FIVE}
+          print("base P90-P10: " + "  ".join(f"{a}+{diffs[a]:.0f}" for a in FIVE))
+          pmean = sum(int(r["power"]) for r in base) / n
+          print(f"base power 均值: {pmean:.0f}")
+
+          print(f"\n{'变体':<20} {'均分':>8} {'Δ配对':>8} {'t':>7} {'训练PT':>7} {'power':>6}  判定")
+          rows_out = []
+          for v in VARIANTS:
+              rows = base if v == "base" else load(v)
+              assert [r["seed"] for r in rows] == seeds, f"{v}: seed 流不一致"
+              s = [float(r["score"]) for r in rows]
+              diffs2 = [a - b for a, b in zip(s, b_scores)]
+              d = sum(diffs2) / n
+              sd = (sum((x - d) ** 2 for x in diffs2) / (n - 1)) ** 0.5
+              t = d / (sd / math.sqrt(n)) if sd > 0 else 0.0
+              pt = sum(int(r["skill_pt"]) for r in rows) / n
+              pm = sum(int(r["power"]) for r in rows) / n
+              m = sum(s) / n
+              verdict = "（对照）" if v == "base" else ("采纳 ✅" if (t > 2 and d > 0) else "未超")
+              print(f"{v:<20} {m:>8.1f} {d:>+8.1f} {t:>+7.2f} {pt:>7.0f} {pm:>6.0f}  {verdict}")
+              rows_out.append((v, m, d, t, pt, pm, verdict))
+
+          winners = [r for r in rows_out if r[6] == "采纳 ✅"]
+          print(f"\n采纳数：{len(winners)}/{len(VARIANTS)-1}")
+          if winners:
+              best = max(winners, key=lambda r: r[2])
+              print(f"最优候选：{best[0]}（Δ={best[2]:+.1f}, t={best[3]:+.2f}）→ 下轮细扫")
+              bp = best[5]
+              print(f"最优变体 power 均值 {bp:.0f} vs base {pmean:.0f}（差 {bp-pmean:+.0f}）")
+          else:
+              print("全负 → power 抑制定价方向被数据否决")
+          with open("SUMMARY.txt", "w") as f:
+              f.write(f"base mean={b_mean:.1f}\n")
+              for r in rows_out:
+                  f.write(f"{r[0]}: mean={r[1]:.1f} d={r[2]:+.1f} t={r[3]:+.2f} pt={r[4]:.0f} power={r[5]:.0f} {r[6]}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-006e-summary
+          path: SUMMARY.txt
+          retention-days: 30
