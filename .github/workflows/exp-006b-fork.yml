@@ -1,0 +1,136 @@
+name: EXP-006b 手写策略 fork 独立复测（xf8410/umaai-rs，同协议 525×8）
+
+on:
+  workflow_dispatch:
+
+env:
+  FORK_REPO: xf8410/umaai-rs
+  FORK_REF: master
+
+jobs:
+  # 手写档（= fork 内 RecommendedRamenTrainer）：在用户自己的 fork 快照上复现 6w5 量级
+  bench-handwritten:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.FORK_REF }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record fork HEAD
+        run: git rev-parse HEAD | tee fork_head.txt
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: fork-baseline-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Verify in-repo gamedata
+        run: ls gamedata/constants.json gamedata/cardDB.json gamedata/umaDB.json
+      - name: Build bench
+        run: cargo build --release -p umasim --bin ramen_space_bench
+      - name: Run bench (handwritten, 525×8, seed 61444)
+        run: |
+          mkdir -p experiment_output
+          ./target/release/ramen_space_bench --trainer handwritten \
+            --runs-per-plan 8 --seed 61444 \
+            --csv experiment_output/fork_handwritten.csv 2>&1 | tail -45
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-006b-fork-handwritten
+          path: |
+            experiment_output/
+            fork_head.txt
+          retention-days: 30
+          if-no-files-found: error
+
+  # random 档基线（fork 版）：sanity 下界
+  bench-random:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.FORK_REF }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: fork-baseline-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Build bench
+        run: cargo build --release -p umasim --bin ramen_space_bench
+      - name: Run bench (random, 525×8, seed 61444)
+        run: |
+          mkdir -p experiment_output
+          ./target/release/ramen_space_bench --trainer random \
+            --runs-per-plan 8 --seed 61444 \
+            --csv experiment_output/fork_random.csv 2>&1 | tail -45
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-006b-fork-random
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  summary:
+    needs: [bench-handwritten, bench-random]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-006b-fork-*
+          path: downloaded
+          merge-multiple: false
+      - name: 汇总对照（fork vs pin 65438±54.5）
+        run: |
+          python3 - <<'PY'
+          import csv, glob, math
+
+          def stats(path):
+              rows = list(csv.DictReader(open(path, newline="")))
+              scores = [int(r["score"]) for r in rows]
+              n = len(scores)
+              mean = sum(scores) / n
+              sd = (sum((x - mean) ** 2 for x in scores) / (n - 1)) ** 0.5
+              return n, mean, sd, min(scores), max(scores), sum(r["free_race_ok"] == "0" for r in rows)
+
+          hw = glob.glob("downloaded/EXP-006b-fork-handwritten/**/fork_handwritten.csv", recursive=True)
+          rd = glob.glob("downloaded/EXP-006b-fork-random/**/fork_random.csv", recursive=True)
+          assert hw and rd, f"CSV 缺失: hw={hw} rd={rd}"
+          n1, m1, s1, lo1, hi1, f1 = stats(hw[0])
+          n2, m2, s2, lo2, hi2, f2 = stats(rd[0])
+          print(f"fork handwritten: n={n1} mean={m1:.1f} sd={s1:.1f} se={s1/math.sqrt(n1):.1f} "
+                f"min={lo1} max={hi1} 自选未达标={f1}")
+          print(f"fork random:      n={n2} mean={m2:.1f} sd={s2:.1f} "
+                f"min={lo2} max={hi2} 自选未达标={f2}")
+          PIN = 65438.2
+          PIN_SE = 54.5
+          diff = m1 - PIN
+          print(f"\n对照：pin 43f532c 手写 = {PIN} ± {PIN_SE}")
+          print(f"fork − pin = {diff:+.1f}（{abs(diff)/PIN_SE:.1f} 个 pin-SE）")
+          if abs(diff) < 4 * PIN_SE + 2 * s1 / math.sqrt(n1):
+              print("判读：量级复现（差异在两份快照漂移+抽样噪声的宽容带内）→ 6w5 非本仓虚高")
+          else:
+              print("判读：差异超出宽容带 → 需按 fork↔pin 的引擎/权重 diff 逐项归因（不轻断对错）")
+          with open("SUMMARY.txt", "w") as f:
+              f.write(f"fork_handwritten mean={m1:.1f} sd={s1:.1f} min={lo1} max={hi1}\n")
+              f.write(f"fork_random mean={m2:.1f}\n")
+              f.write(f"pin_handwritten mean={PIN}\n")
+              f.write(f"diff={diff:+.1f}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-006b-fork-summary
+          path: SUMMARY.txt
+          retention-days: 30
