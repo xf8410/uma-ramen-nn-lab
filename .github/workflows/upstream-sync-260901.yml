@@ -1,0 +1,98 @@
+name: EXP-SYNC-260901 上游换 pin 保真检查（d27a6eb，base 4200 局，纯上游无 patch）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify new pin registered in UPSTREAM.md
+        run: |
+          GOT=$(git rev-parse HEAD)
+          echo "checked-out pin: $GOT"
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT 不在 UPSTREAM.md"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-sync-260901-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: lab-sync-260901-${{ runner.os }}-
+      - name: Confirm gamedata is pinned in-tree (260901)
+        run: |
+          ls -la gamedata/ | head -20
+          test -f gamedata/constants.json || { echo "缺 constants.json"; exit 1; }
+          test -f gamedata/cardDB.json || { echo "缺 cardDB.json"; exit 1; }
+          echo "gamedata 随 pin commit 入库，不再从 master raw 下载"
+      - name: Build bench
+        run: cargo build --release -p umasim --bin ramen_space_bench
+      - name: Run bench (base, 525x8)
+        run: |
+          mkdir -p experiment_output
+          ./target/release/ramen_space_bench --trainer handwritten \
+            --runs-per-plan 8 --seed 61444 \
+            --csv experiment_output/sync260901_base.csv 2>&1 | tail -60
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SYNC-260901-base
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  summary:
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SYNC-260901-base
+          path: downloaded
+      - name: 基线保真判定（vs 43f532c 口径 65438.2）
+        run: |
+          python3 - <<'PY'
+          import csv, glob, math
+
+          hits = glob.glob("downloaded/**/sync260901_base.csv", recursive=True)
+          assert hits, "缺 CSV"
+          rows = list(csv.DictReader(open(hits[0], newline="")))
+          n = len(rows)
+          scores = [float(r["score"]) for r in rows]
+          mean = sum(scores) / n
+          se = (sum((x - mean) ** 2 for x in scores) / (n - 1)) ** 0.5 / math.sqrt(n)
+
+          PIN, PIN_SE = 65438.2, 54.5   # 43f532c 口径（三重复现）
+          drift = mean - PIN
+          print(f"新 pin d27a6eb: n={n} mean={mean:.1f} se={se:.1f}")
+          print(f"旧 pin 43f532c 口径: {PIN} ± {PIN_SE}")
+          print(f"漂移: {drift:+.1f}  ({drift/PIN_SE:+.2f} SE)")
+
+          cols = list(rows[0].keys())
+          print(f"\nCSV 列数 {len(cols)}（旧口径 30）: {','.join(cols)}")
+
+          if abs(drift) < 4 * PIN_SE:
+              print("\n判定: FIDELITY OK —— 数据更新 260901 未影响 gen1 空间，")
+              print("  65438.2 基线与 EXP-001~006d 全部对照结论在新 pin 上继续有效")
+          else:
+              print("\n判定: BASELINE DRIFT —— 新 pin 上基线重定义为 "
+                    f"{mean:.1f}±{se:.1f}，历史数字标注「43f532c 口径」，新旧不跨池比较")
+              print("  需检查: 五维初始/上限/成长率是否被 260901 改动（umaDB.json +73 行）")
+          PY
+      - name: 判定结果回传
+        run: echo "summary done"
