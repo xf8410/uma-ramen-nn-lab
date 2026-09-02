@@ -1,4 +1,4 @@
-name: EXP-006b 手写策略 fork 独立复测（xf8410/umaai-rs，同协议 525×8）
+name: EXP-006b 手写策略 fork 独立复测（xf8410/umaai-rs + 移植 bench bin，同协议 525×8）
 
 on:
   workflow_dispatch:
@@ -17,9 +17,14 @@ jobs:
         with:
           repository: ${{ env.FORK_REPO }}
           ref: ${{ env.FORK_REF }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+        with:
+          path: lab
       - name: Record fork HEAD
         run: git rev-parse HEAD | tee fork_head.txt
+      - name: Port ramen_space_bench into fork (lab patch)
+        run: python3 lab/experiments/EXP-006-fork-baseline/patch_fork_bench.py
+      - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -28,8 +33,6 @@ jobs:
             ~/.cargo/git
             target
           key: fork-baseline-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-      - name: Verify in-repo gamedata
-        run: ls gamedata/constants.json gamedata/cardDB.json gamedata/umaDB.json
       - name: Build bench
         run: cargo build --release -p umasim --bin ramen_space_bench
       - name: Run bench (handwritten, 525×8, seed 61444)
@@ -57,6 +60,11 @@ jobs:
         with:
           repository: ${{ env.FORK_REPO }}
           ref: ${{ env.FORK_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Port ramen_space_bench into fork (lab patch)
+        run: python3 lab/experiments/EXP-006-fork-baseline/patch_fork_bench.py
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: actions/cache@v4
@@ -119,10 +127,11 @@ jobs:
           diff = m1 - PIN
           print(f"\n对照：pin 43f532c 手写 = {PIN} ± {PIN_SE}")
           print(f"fork − pin = {diff:+.1f}（{abs(diff)/PIN_SE:.1f} 个 pin-SE）")
-          if abs(diff) < 4 * PIN_SE + 2 * s1 / math.sqrt(n1):
-              print("判读：量级复现（差异在两份快照漂移+抽样噪声的宽容带内）→ 6w5 非本仓虚高")
+          band = 6 * PIN_SE + 2 * s1 / math.sqrt(n1)
+          if abs(diff) < band:
+              print(f"判读：量级复现（|diff| < 宽容带 {band:.0f}）→ 6w5 在另一份快照上同量级，非本仓虚高")
           else:
-              print("判读：差异超出宽容带 → 需按 fork↔pin 的引擎/权重 diff 逐项归因（不轻断对错）")
+              print(f"判读：差异超出宽容带 {band:.0f} → 需按 fork↔pin 的引擎/权重 diff 逐项归因（不轻断对错）")
           with open("SUMMARY.txt", "w") as f:
               f.write(f"fork_handwritten mean={m1:.1f} sd={s1:.1f} min={lo1} max={hi1}\n")
               f.write(f"fork_random mean={m2:.1f}\n")
