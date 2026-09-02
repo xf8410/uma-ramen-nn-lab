@@ -1,0 +1,60 @@
+name: EXP-001a 手写基线锚点
+
+on:
+  workflow_dispatch:
+
+jobs:
+  exp-001a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+      UPSTREAM_REF: 43f532c599d8591f16b1fcdd2e301ebff858d511
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+
+      - name: Verify upstream pin (UPSTREAM.md 白名单)
+        run: |
+          GOT=$(git rev-parse HEAD)
+          echo "checked out $GOT"
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp-${{ runner.os }}-
+            lab-smoke-${{ runner.os }}-
+
+      - name: Download gamedata (必需)
+        run: |
+          mkdir -p gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl -sSL "$BASE/$f" -o "gamedata/$f" || exit 1
+          done
+
+      - name: Run EXP-001a
+        run: bash "lab/experiments/EXP-001-anchor-recheck/run.sh"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-001a-artifacts
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
