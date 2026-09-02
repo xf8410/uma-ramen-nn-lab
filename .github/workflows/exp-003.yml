@@ -129,6 +129,8 @@ jobs:
           if-no-files-found: error
 
   # 汇总：3 种子期望后悔值对比（Python 侧参考；最终裁决=EXP-004 Rust 闭环）
+  # v2 修复：train artifact 上传的是 saved_models/seedX 目录本身，artifact 根 = seedX 内容
+  #（v4 会剥掉最小公共祖先），因此文件直接在 {d}/ 下，不再有 seed{X}/ 一层
   summary:
     needs: train
     runs-on: ubuntu-latest
@@ -147,12 +149,16 @@ jobs:
           rows = []
           for d in sorted(glob.glob("downloaded/EXP-003-model-seed*")):
               seed = d.rsplit("seed", 1)[-1]
-              metrics = [json.loads(l) for l in open(f"{d}/seed{seed}/metrics.jsonl")]
+              mpath = f"{d}/metrics.jsonl"
+              assert os.path.exists(mpath), f"metrics.jsonl 缺失: {mpath}（实际内容: {sorted(os.listdir(d))[:10]}）"
+              metrics = [json.loads(l) for l in open(mpath)]
               best = min(m["best_regret"] for m in metrics)
               epochs = len(metrics)
-              run = json.load(open(f"{d}/seed{seed}/run.json"))
+              run = json.load(open(f"{d}/run.json"))
+              has_onnx = os.path.exists(f"{d}/model.onnx")
+              assert has_onnx, f"model.onnx 缺失: {d}"
               rows.append((seed, best, epochs, run["parameters"]))
-              print(f"seed {seed}: best_regret={best:.1f}  epochs={epochs}  params={run['parameters']:,}")
+              print(f"seed {seed}: best_regret={best:.1f}  epochs={epochs}  params={run['parameters']:,}  onnx={has_onnx}")
 
           mean = sum(r[1] for r in rows) / len(rows)
           print(f"\n3-seed mean best_regret = {mean:.1f}")
