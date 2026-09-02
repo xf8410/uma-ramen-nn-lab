@@ -1,0 +1,170 @@
+name: EXP-003 搜索蒸馏训练（矩阵多种子）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: 43f532c599d8591f16b1fcdd2e301ebff858d511
+  EXP002_RUN_ID: "33585590880"
+
+jobs:
+  # 单 job：bincode → npy(--raw) → 标签（Bayesian bootstrap + cross-fit value）
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp-${{ runner.os }}-
+            lab-smoke-${{ runner.os }}-
+      - name: Download gamedata (必需)
+        run: |
+          mkdir -p gamedata
+          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
+          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+            curl -sSL "$BASE/$f" -o "gamedata/$f" || exit 1
+          done
+      - name: Download EXP-002 dataset
+        uses: actions/download-artifact@v4
+        with:
+          name: EXP-002-dataset
+          path: training_data/exp002_merged
+          repository: ${{ github.repository }}
+          run-id: ${{ env.EXP002_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: Build ramen_export_npy
+        run: cargo build --release -p umasim --bin ramen_export_npy
+      - name: Export npy (--raw)
+        run: ./target/release/ramen_export_npy --input training_data/exp002_merged --output-dir training_data/npy_v1 --raw
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install python deps (CPU torch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy onnx onnxruntime
+      - name: Generate labels
+        run: python3 scripts/ramen_nn/labels.py --input training_data/npy_v1 --output training_data/labels_v1
+      - name: Upload npy + labels
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-003-npy-labels
+          path: |
+            training_data/npy_v1
+            training_data/labels_v1
+          retention-days: 30
+          if-no-files-found: error
+
+  # 矩阵：3 种子并行训练（用户裁定的矩阵做法）
+  train:
+    needs: convert
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [20260830, 20260831, 20260832]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install python deps (CPU torch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy onnx onnxruntime
+      - name: Download npy + labels
+        uses: actions/download-artifact@v4
+        with:
+          name: EXP-003-npy-labels
+          path: training_data
+      - name: Train (seed ${{ matrix.seed }})
+        run: |
+          python3 scripts/ramen_nn/train.py \
+            --data training_data/npy_v1 \
+            --labels training_data/labels_v1 \
+            --output-dir saved_models/seed${{ matrix.seed }} \
+            --seed ${{ matrix.seed }} \
+            --device cpu \
+            --epochs 200
+      - name: Export ONNX (内置 batch1&7 对拍 <1e-4)
+        run: |
+          python3 scripts/ramen_nn/export_onnx.py \
+            --checkpoint saved_models/seed${{ matrix.seed }}/best.pt \
+            --output saved_models/seed${{ matrix.seed }}/model.onnx
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-003-model-seed${{ matrix.seed }}
+          path: saved_models/seed${{ matrix.seed }}
+          retention-days: 30
+          if-no-files-found: error
+
+  # 汇总：3 种子期望后悔值对比（Python 侧参考；最终裁决=EXP-004 Rust 闭环）
+  summary:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-003-model-seed*
+          path: downloaded
+          merge-multiple: false
+      - name: 汇总 3 种子指标
+        run: |
+          python3 - <<'PY'
+          import json, glob, os
+
+          rows = []
+          for d in sorted(glob.glob("downloaded/EXP-003-model-seed*")):
+              seed = d.rsplit("seed", 1)[-1]
+              metrics = [json.loads(l) for l in open(f"{d}/seed{seed}/metrics.jsonl")]
+              best = min(m["best_regret"] for m in metrics)
+              epochs = len(metrics)
+              run = json.load(open(f"{d}/seed{seed}/run.json"))
+              rows.append((seed, best, epochs, run["parameters"]))
+              print(f"seed {seed}: best_regret={best:.1f}  epochs={epochs}  params={run['parameters']:,}")
+
+          mean = sum(r[1] for r in rows) / len(rows)
+          print(f"\n3-seed mean best_regret = {mean:.1f}")
+          print("参考: 旧 pilot 11957 条 × 15 epoch × 3 种子 = 148.8（同协议，非正式对照）")
+          verdict = "OK（同量级）" if mean < 200 else "劣化（>200，先查数据/标签）"
+          print(f"Python 侧判读: {verdict}；最终裁决 = EXP-004 Rust 闭环 vs ANCHOR-003(64958)")
+          open("SUMMARY.txt", "w").write(
+              "\n".join(f"seed {s}: {b:.1f} ({e} ep)" for s, b, e, _ in rows)
+              + f"\nmean={mean:.1f}\n{verdict}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-003-summary
+          path: SUMMARY.txt
+          retention-days: 30
