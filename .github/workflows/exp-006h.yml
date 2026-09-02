@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [base, g3160-g2170-cook60, g3200-g2170-cook60, g3240-g2170-cook60, g2300-g3160-cook60, g2250-g3160-cook60, g3160-g2170-cook50, o2100-g3160-g2170-cook60, o3100-g3160-g2170-cook60, g3160-g2300-cook60]
+        variant: [base, g3160-g2170-cook60, g3200-g2170-cook60, g3240-g2170-cook60, g2300-g3160-cook60, g2250-g3160-cook60, g3160-g2170-cook50, o2100-g3160-g2170-cook60, o3100-g3160-g2170-cook60, g2200-g3160-cook60]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,7 +79,7 @@ jobs:
 
           VARIANTS = ["base", "g3160-g2170-cook60", "g3200-g2170-cook60", "g3240-g2170-cook60",
                       "g2300-g3160-cook60", "g2250-g3160-cook60", "g3160-g2170-cook50",
-                      "o2100-g3160-g2170-cook60", "o3100-g3160-g2170-cook60", "g3160-g2300-cook60"]
+                      "o2100-g3160-g2170-cook60", "o3100-g3160-g2170-cook60", "g2200-g3160-cook60"]
           FIVE = ["speed", "stamina", "power", "guts", "wisdom"]
 
           def load(v):
@@ -98,7 +98,7 @@ jobs:
           print(f"base: n={n} mean={b_mean:.1f} se={b_se:.1f}  | pin {PIN}±{PIN_SE}  偏差 {b_mean-PIN:+.1f}")
           assert abs(b_mean - PIN) < 4 * PIN_SE, f"BASE DRIFT: {b_mean} vs {PIN}"
 
-          print(f"\n{'变体':<26} {'均分':>8} {'Δ配对':>8} {'t':>7} {'PT':>6} | {'速':>5} {'耐':>5} {'力':>5} {'根':>5} {'智':>5} | {'RMJ':>5} {'吃面':>5}  判定")
+          print(f"\n{'变体':<28} {'均分':>8} {'Δ配对':>8} {'t':>7} {'PT':>6} | {'速':>5} {'耐':>5} {'力':>5} {'根':>5} {'智':>5} | {'RMJ':>5} {'吃面':>5}  判定")
           rows_out = []
           for v in VARIANTS:
               rows = base if v == "base" else load(v)
@@ -114,7 +114,7 @@ jobs:
               rmj = sum(int(r["rmj_ok"]) for r in rows) / n
               et = sum(sum(int(r[f"eat_count_y{y+1}"]) for y in range(3)) for r in rows) / n
               verdict = "（对照）" if v == "base" else ("采纳 ✅" if (t > 2 and d > 0) else "未超")
-              print(f"{v:<26} {m:>8.1f} {d:>+8.1f} {t:>+7.2f} {pt:>6.0f} | "
+              print(f"{v:<28} {m:>8.1f} {d:>+8.1f} {t:>+7.2f} {pt:>6.0f} | "
                     f"{fs[0]:>5.0f} {fs[1]:>5.0f} {fs[2]:>5.0f} {fs[3]:>5.0f} {fs[4]:>5.0f} | "
                     f"{rmj:>5.2f} {et:>5.1f}  {verdict}")
               rows_out.append((v, m, d, t, pt, fs, rmj, et, verdict))
@@ -127,9 +127,9 @@ jobs:
               ref = next((r for r in rows_out if r[0] == "g3160-g2170-cook60"), None)
               if ref:
                   print(f"carry g3160-g2170-cook60 本轮 Δ={ref[2]:+.1f}（006g 口径 +72.3，同种子应逐位复现）")
-              g3s = [(r[0], r[2]) for r in rows_out if r[0].startswith("g32") or r[0].startswith("g3160-g2170-cook60")]
-              print("g3 上行趋势（在 g2170-cook60 底座上）: " +
-                    "  ".join(f"{v.split('-')[0]}:{d:+.1f}" for v, d in sorted(g3s, key=lambda x: x[0])))
+              trio = [(r[0], r[2]) for r in rows_out if r[0].startswith("g3") and r[0].endswith("cook60") and "o2" not in r[0] and "o3" not in r[0]]
+              if trio:
+                  print("g3/g2 扫描趋势: " + "  ".join(f"{v}={d:+.1f}" for v, d in sorted(trio)))
           else:
               print("全负")
           with open("SUMMARY.txt", "w") as f:
