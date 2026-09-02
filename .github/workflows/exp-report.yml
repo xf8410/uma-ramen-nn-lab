@@ -1,4 +1,4 @@
-name: 跑分详报（属性/PT/评分/最高最低/等级分布，两代模型对照）
+name: 跑分详报 v2（总分为主：分布/最高最低/等级；RMJ 大成功年数；属性只作分数对照画像）
 
 on:
   workflow_dispatch:
@@ -34,6 +34,8 @@ jobs:
           import csv, glob, os
           from collections import Counter
 
+          ZH = {"speed": "速", "stamina": "耐", "power": "力", "guts": "根", "wisdom": "智"}
+
           def pctl(sorted_v, p):
               if not sorted_v: return 0.0
               pos = p * (len(sorted_v) - 1); lo = int(pos); hi = min(lo + 1, len(sorted_v) - 1)
@@ -44,70 +46,92 @@ jobs:
               return (sum((x - mean(v)) ** 2 for x in v) / (len(v) - 1)) ** 0.5 if len(v) > 1 else 0.0
 
           def load(pattern):
-              hits = glob.glob(pattern, recursive=True)
-              if not hits: return None
-              with open(hits[0], newline="") as f:
-                  return list(csv.DictReader(f))
+              hits = sorted(glob.glob(pattern, recursive=True))
+              return None if not hits else list(csv.DictReader(open(hits[0], newline="")))
+
+          def game_line(r):
+              pt = "/".join(r[f"scenario_pt_y{y}"] for y in (1, 2, 3))
+              return (f"{r['score']}分（{r['rank']}）五维 {r['speed']}/{r['stamina']}/{r['power']}/{r['guts']}/{r['wisdom']} "
+                      f"技能点{r['skill_pt']} RMJ大成功{r['rmj_ok']}/3年 逐年PT(Y1/Y2/Y3)={pt}")
 
           def report(name, rows):
               if not rows:
                   return f"\n## {name}\n（无数据）\n"
               scores = sorted(int(r["score"]) for r in rows)
               n = len(rows)
-              attrs = {k: [int(r[k]) for r in rows] for k in ("speed", "stamina", "power", "guts", "wisdom")}
-              pt = {y: [int(r[f"scenario_pt_y{y}"]) for r in rows] for y in (1, 2, 3)}
-              pt_total = [a + b + c for a, b, c in zip(pt[1], pt[2], pt[3])]
-              eat = [int(r[f"eat_count_y{y}"]) for r in rows for y in (1, 2, 3)]
-              rmj = [int(r["rmj_ok"]) for r in rows]
               fails = sum(r["free_race_ok"] == "0" for r in rows)
               ranks = Counter(r["rank"] for r in rows)
+              rmj = Counter(r["rmj_ok"] for r in rows)  # RMJ 大成功年数 0..3
+              pt_y = {y: [int(r[f"scenario_pt_y{y}"]) for r in rows] for y in (1, 2, 3)}
               best = max(rows, key=lambda r: int(r["score"]))
               worst = min(rows, key=lambda r: int(r["score"]))
-              shapes = Counter(r["build"] for r in rows)
               by_shape = {}
               for r in rows:
                   by_shape.setdefault(r["build"], []).append(int(r["score"]))
+              # 属性画像：分数 P90 组 vs P10 组（属性只为解释总分，不单独报均值）
+              k = max(1, n // 10)
+              hi, lo = scores[-k:], scores[:k]
+              hi_idx = {id(r) for r in rows if int(r["score"]) >= hi[0]}
+              lo_idx = {id(r) for r in rows if int(r["score"]) <= lo[-1]}
+              prof = {}
+              for grp, idxs in (("P90 高分组", hi_idx), ("P10 低分组", lo_idx)):
+                  sel = [r for r in rows if id(r) in idxs]
+                  prof[grp] = {a: mean([int(r[a]) for r in sel]) for a in ZH}
 
               L = [f"\n## {name}（{n} 局）", ""]
-              L.append("### 评分")
-              L.append(f"- 均值 {mean(scores):.1f}  标准差 {sd(scores):.1f}")
-              L.append(f"- 最高 {scores[-1]}  最低 {scores[0]}  中位 {pctl(scores, .5):.0f}")
+              L.append("### 评分（总分，核心指标）")
+              L.append(f"- 均值 **{mean(scores):.1f}** ± {sd(scores):.1f}（标准误 {sd(scores)/n**0.5:.1f}）")
+              L.append(f"- 最高 **{scores[-1]}**  最低 **{scores[0]}**  中位 {pctl(scores,.5):.0f}")
               L.append(f"- 分位: P10={pctl(scores,.1):.0f}  P25={pctl(scores,.25):.0f}  P75={pctl(scores,.75):.0f}  P90={pctl(scores,.9):.0f}")
-              L.append(f"- 等级分布: " + "  ".join(f"{k}×{v}" for k, v in sorted(ranks.items(), key=lambda x: -x[1])))
-              L.append(f"- 自选比赛未达标: {fails} 局（{100.0 * fails / n:.2f}%）")
-              L.append("\n### 五维属性（均值 ± 标准差）")
-              zh = {"speed": "速", "stamina": "耐", "power": "力", "guts": "根", "wisdom": "智"}
-              for k, v in attrs.items():
-                  L.append(f"- {zh[k]}: {mean(v):.0f} ± {sd(v):.0f}")
-              L.append("\n### 剧本 PT / 吃面 / RMJ")
-              L.append(f"- 逐年 PT 均值: Y1 {mean(pt[1]):.0f} / Y2 {mean(pt[2]):.0f} / Y3 {mean(pt[3]):.0f}（合计 {mean(pt_total):.0f}）")
-              L.append(f"- 三年吃面次数均值: {mean(eat):.2f}/年")
-              L.append(f"- RMJ 成功年数均值: {mean(rmj):.2f} / 3")
+              L.append(f"- 等级分布: " + "  ".join(f"{r_}×{c}" for r_, c in sorted(ranks.items(), key=lambda x: -x[1])))
+              L.append(f"- 自选比赛未达标: {fails} 局（{100.0*fails/n:.2f}%）")
+              L.append("\n### RMJ（每年 PT 独立清零，只看大成功年数，不求和）")
+              L.append("- 大成功年数分布: " + "  ".join(f"{y}/3年×{rmj.get(str(y),0)}局" for y in (3, 2, 1, 0) if rmj.get(str(y))))
+              L.append(f"- 各年 PT 均值（参考）: Y1 {mean(pt_y[1]):.0f}  Y2 {mean(pt_y[2]):.0f}  Y3 {mean(pt_y[3]):.0f}（逐年独立，不可加总）")
+              L.append("\n### 属性画像（只用于解释总分：高分组 vs 低分组的差 = 提分靠什么属性）")
+              L.append("| 分组 | 速 | 耐 | 力 | 根 | 智 |")
+              L.append("|---|---:|---:|---:|---:|---:|")
+              for grp in ("P90 高分组", "P10 低分组"):
+                  p = prof[grp]
+                  L.append(f"| {grp} | {p['speed']:.0f} | {p['stamina']:.0f} | {p['power']:.0f} | {p['guts']:.0f} | {p['wisdom']:.0f} |")
+              diff = {a: prof["P90 高分组"][a] - prof["P10 低分组"][a] for a in ZH}
+              top = sorted(diff.items(), key=lambda x: -x[1])[:2]
+              L.append(f"- 差值最大的属性: " + "、".join(f"{ZH[a]}(+{d:.0f})" for a, d in top))
               L.append("\n### 最高分对局")
-              L.append(f"- {int(best['score'])} 分（{best['rank']}）五维 {best['speed']}/{best['stamina']}/{best['power']}/{best['guts']}/{best['wisdom']}  技能点 {best['skill_pt']}  PT合计 {int(best['scenario_pt_y1'])+int(best['scenario_pt_y2'])+int(best['scenario_pt_y3'])}")
+              L.append(f"- {game_line(best)}")
               L.append("\n### 最低分对局")
-              L.append(f"- {int(worst['score'])} 分（{worst['rank']}）五维 {worst['speed']}/{worst['stamina']}/{worst['power']}/{worst['guts']}/{worst['wisdom']}  技能点 {worst['skill_pt']}  PT合计 {int(worst['scenario_pt_y1'])+int(worst['scenario_pt_y2'])+int(worst['scenario_pt_y3'])}")
-              L.append("\n### 按卡组构成")
+              L.append(f"- {game_line(worst)}")
+              L.append("\n### 按卡组构成（总分）")
               L.append("| 构成 | 局数 | 均分 | 最低 | 最高 |")
               L.append("|---|---:|---:|---:|---:|")
-              for k in sorted(by_shape, key=lambda k: -mean(by_shape[k])):
-                  v = sorted(by_shape[k])
-                  L.append(f"| {k} | {len(v)} | {mean(v):.0f} | {v[0]} | {v[-1]} |")
+              for kk in sorted(by_shape, key=lambda kk: -mean(by_shape[kk])):
+                  v = sorted(by_shape[kk])
+                  L.append(f"| {kk} | {len(v)} | {mean(v):.0f} | {v[0]} | {v[-1]} |")
               return "\n".join(L) + "\n"
 
-          out = ["# 跑分详报", ""]
-          for gen, run_name, pattern in (("gen1", "第一代（sn8 模型）+ 手写", "gen1/**/exp004_*.csv"),
-                                         ("gen2", "第二代（sn64 模型）+ 手写复跑", "gen2/**/exp004b_*.csv")):
-              out.append(f"\n---\n\n# {run_name}")
+          out = ["# 跑分详报（总分为主）", ""]
+          for gen, title, stem in (("gen1", "第一代：sn8 模型（regret 309.7）+ 手写", "exp004_"),
+                                   ("gen2", "第二代：sn64 模型（regret 90.3）+ 手写复跑", "exp004b_")):
+              out.append(f"\n---\n\n# {title}")
               for tag in ("handwritten", "nn-seed20260830", "nn-seed20260831", "nn-seed20260832"):
-                  rows = load(pattern.replace("exp004", ("exp004" if gen == "gen1" else "exp004b")).replace("exp004b_", f"exp004b_{tag.replace('nn-', 'nn-')}_") if False else (pattern if tag == "handwritten" else pattern))
+                  rows = load(f"{gen}/**/{stem}{tag}.csv")
                   out.append(report(f"{gen} {tag}", rows))
 
-          # 手写文件名是 exp004_handwritten / exp004b_handwritten，NN 是 exp004_nn-seedX / exp004b_nn-seedX
-          # 上面的 glob 通配已覆盖（exp004_*.csv 会同时命中 handwritten 与 nn-*），但为避免
-          # gen1 的 exp004_*.csv 混入 gen2 目录（目录已分开），无需进一步处理。
+          # 跨代对照表：同一手写口径 + 两代 NN
+          out.append("\n---\n\n# 总分对照速览")
+          out.append("| 组 | gen1 | gen2 | 变化 |")
+          out.append("|---|---:|---:|---:|")
+          for tag in ("handwritten", "nn-seed20260830", "nn-seed20260831", "nn-seed20260832"):
+              r1, r2 = load(f"gen1/**/exp004_{tag}.csv"), load(f"gen2/**/exp004b_{tag}.csv")
+              m1 = mean([int(r["score"]) for r in r1]) if r1 else None
+              m2 = mean([int(r["score"]) for r in r2]) if r2 else None
+              if m1 is not None and m2 is not None:
+                  out.append(f"| {tag} | {m1:.0f} | {m2:.0f} | {m2-m1:+.0f} |")
+              elif m2 is not None:
+                  out.append(f"| {tag} | — | {m2:.0f} | — |")
+
           open("REPORT.md", "w").write("\n".join(out))
-          print("\n".join(out)[:4000])
+          print("\n".join(out)[:3500])
           PY
       - uses: actions/upload-artifact@v4
         with:
