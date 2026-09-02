@@ -1,0 +1,154 @@
+name: EXP-006 评分审计（独立重算评分，逐局断言 == 模拟器结算）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: 43f532c599d8591f16b1fcdd2e301ebff858d511
+  MODEL_RUN_ID: "33617619566"
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: handwritten, trainer: handwritten }
+          - { id: nn-seed20260830, trainer: nn, seed: "20260830" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply score-audit patch (bench.rs +skill_score +total_hints)
+        run: |
+          python3 lab/experiments/EXP-006-score-audit/patch_bench.py
+          grep -n "skill_score" crates/umasim/src/bench.rs | head -5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp-${{ runner.os }}-
+            lab-smoke-${{ runner.os }}-
+      - name: Cache gamedata
+        uses: actions/cache@v4
+        with:
+          path: gamedata
+          key: gamedata-xulai1001-master-20260902
+      - name: Download gamedata (必需；缓存命中则跳过；curl 带重试)
+        run: |
+          if [ -f gamedata/constants.json ] && [ -f gamedata/cardDB.json ] && [ -f gamedata/umaDB.json ] && [ -f gamedata/text_data_dict.json ] && [ -f gamedata/events.json ] && [ -f gamedata/scenario_ramen.json ] && [ -f gamedata/scenario_onsen.json ] && [ -f gamedata/default_config.toml ]; then
+            echo "gamedata 缓存命中，跳过下载"
+          else
+            mkdir -p gamedata
+            BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
+            for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+              curl -sSL --retry 5 --retry-delay 5 --retry-all-errors "$BASE/$f" -o "gamedata/$f" || exit 1
+            done
+          fi
+      - name: Download model (NN 组)
+        if: matrix.trainer == 'nn'
+        uses: actions/download-artifact@v4
+        with:
+          name: EXP-005-model-seed${{ matrix.seed }}
+          path: models/seed${{ matrix.seed }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.MODEL_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: Build bench（feature onnx）
+        run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
+      - name: Run bench (${{ matrix.id }})
+        run: |
+          mkdir -p experiment_output
+          ARGS="--runs-per-plan 8 --seed 61444 --csv experiment_output/exp006_${{ matrix.id }}.csv"
+          if [ "${{ matrix.trainer }}" = "nn" ]; then
+            ./target/release/ramen_space_bench --trainer nn \
+              --model "models/seed${{ matrix.seed }}/model.onnx" $ARGS 2>&1 | tail -45
+          else
+            ./target/release/ramen_space_bench --trainer handwritten $ARGS 2>&1 | tail -45
+          fi
+      - name: Upload bench artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-006-${{ matrix.id }}
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  audit:
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-006-*
+          path: downloaded
+          merge-multiple: false
+      - name: Download gamedata constants (查表+系数)
+        run: |
+          mkdir -p gamedata
+          curl -sSL --retry 5 --retry-delay 5 --retry-all-errors \
+            https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata/constants.json \
+            -o gamedata/constants.json
+      - name: 独立重算评分（"算两遍"，逐局断言）
+        run: |
+          python3 - <<'PY'
+          import csv, glob, json, math
+
+          cons = json.load(open("gamedata/constants.json"))
+          table = cons["five_status_final_score"]
+          PT_RATE = cons["pt_score_rate"]      # 2.0
+          HINT_RATE = cons["hint_pt_rate"]     # 6.5
+          FIVE = ["speed", "stamina", "power", "guts", "wisdom"]
+
+          def lookup(v):
+              return table[max(0, min(int(v), len(table) - 1))]
+
+          print(f"查表长度 {len(table)}，pt_score_rate={PT_RATE}，hint_pt_rate={HINT_RATE}")
+          all_ok = True
+          for path in sorted(glob.glob("downloaded/EXP-006-*/**/exp006_*.csv", recursive=True)):
+              tag = path.split("exp006_")[1].replace(".csv", "")
+              rows = list(csv.DictReader(open(path, newline="")))
+              assert len(rows) == 4200, f"{tag}: 行数 {len(rows)} != 4200"
+              max_diff, mismatches = 0, 0
+              sums = {"five": 0, "pt": 0, "skill": 0, "score": 0}
+              for r in rows:
+                  total_pt = math.floor(int(r["skill_pt"]) + int(r["total_hints"]) * HINT_RATE)
+                  five = sum(lookup(r[k]) for k in FIVE)
+                  pt_term = int(total_pt * PT_RATE)
+                  expected = int(r["skill_score"]) + pt_term + five
+                  diff = expected - int(r["score"])
+                  max_diff = max(max_diff, abs(diff))
+                  mismatches += diff != 0
+                  sums["five"] += five; sums["pt"] += pt_term
+                  sums["skill"] += int(r["skill_score"]); sums["score"] += int(r["score"])
+              n = len(rows)
+              s = sums
+              print(f"\n{tag}: n={n}  max|重算-结算|={max_diff}  不一致局数={mismatches}")
+              print(f"  评分构成均值: 总分 {s['score']/n:.0f} = 五维查表 {s['five']/n:.0f} "
+                    f"({100*s['five']/s['score']:.1f}%) + PT折算 {s['pt']/n:.0f} "
+                    f"({100*s['pt']/s['score']:.1f}%) + 已学技能 {s['skill']/n:.0f} "
+                    f"({100*s['skill']/s['score']:.1f}%)")
+              assert mismatches == 0 and max_diff == 0, f"{tag}: 重算与结算不一致！"
+              all_ok &= mismatches == 0
+
+          print("\nAUDIT " + ("PASS：评分 = 五维查表 + PT折算(×2.0) + 已学技能，逐位一致，无重复计分" if all_ok else "FAIL"))
+          assert all_ok
+          PY
