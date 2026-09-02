@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [base, po100, po150, po200, pg-30, pg-60, p2o300, g295, g2130, g2110-cook60, po150-g2110, pg-60-po150-g2110]
+        variant: [base, po100, po150, po200, pgm30, pgm60, p2o300, g295, g2130, g2110-cook60, po150-g2110, pgm60-po150-g2110]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,11 +27,12 @@ jobs:
         run: |
           GOT=$(git rev-parse HEAD)
           grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
-      - name: Apply EXP-006c + 006d + 006e patches
+      - name: Apply EXP-006c + 006d + 006e + 006e-fix patches
         run: |
           python3 lab/experiments/EXP-006-wisdom-vital/patch_exp006c.py
           python3 lab/experiments/EXP-006-yearphased/patch_exp006d.py
           python3 lab/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e_fix.py
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: actions/cache@v4
@@ -76,8 +77,8 @@ jobs:
           python3 - <<'PY'
           import csv, glob, math
 
-          VARIANTS = ["base", "po100", "po150", "po200", "pg-30", "pg-60", "p2o300",
-                      "g295", "g2130", "g2110-cook60", "po150-g2110", "pg-60-po150-g2110"]
+          VARIANTS = ["base", "po100", "po150", "po200", "pgm30", "pgm60", "p2o300",
+                      "g295", "g2130", "g2110-cook60", "po150-g2110", "pgm60-po150-g2110"]
 
           def load(v):
               hits = glob.glob(f"downloaded/EXP-006e-{v}/**/exp006e_{v}.csv", recursive=True)
@@ -96,7 +97,7 @@ jobs:
           assert abs(b_mean - PIN) < 4 * PIN_SE, f"BASE DRIFT: {b_mean} vs {PIN}"
 
           FIVE = ["speed", "stamina", "power", "guts", "wisdom"]
-          print("\n===== power 专项诊断（base vs 最优 power 变体）=====")
+          print("\n===== power 专项诊断（base）=====")
           srt = sorted(base, key=lambda r: int(r["score"]))
           k = max(1, n // 10)
           lo, hi = srt[:k], srt[-k:]
@@ -105,7 +106,7 @@ jobs:
           pmean = sum(int(r["power"]) for r in base) / n
           print(f"base power 均值: {pmean:.0f}")
 
-          print(f"\n{'变体':<20} {'均分':>8} {'Δ配对':>8} {'t':>7} {'训练PT':>7} {'power':>6}  判定")
+          print(f"\n{'变体':<22} {'均分':>8} {'Δ配对':>8} {'t':>7} {'训练PT':>7} {'power':>6}  判定")
           rows_out = []
           for v in VARIANTS:
               rows = base if v == "base" else load(v)
@@ -119,7 +120,7 @@ jobs:
               pm = sum(int(r["power"]) for r in rows) / n
               m = sum(s) / n
               verdict = "（对照）" if v == "base" else ("采纳 ✅" if (t > 2 and d > 0) else "未超")
-              print(f"{v:<20} {m:>8.1f} {d:>+8.1f} {t:>+7.2f} {pt:>7.0f} {pm:>6.0f}  {verdict}")
+              print(f"{v:<22} {m:>8.1f} {d:>+8.1f} {t:>+7.2f} {pt:>7.0f} {pm:>6.0f}  {verdict}")
               rows_out.append((v, m, d, t, pt, pm, verdict))
 
           winners = [r for r in rows_out if r[6] == "采纳 ✅"]
