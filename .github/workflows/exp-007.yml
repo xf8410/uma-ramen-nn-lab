@@ -1,0 +1,185 @@
+name: EXP-007 新速度卡对比（乐透心 × 千名代表，全空间 1246×8=9968 局）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply EXP-007 patch（速卡池 6→8，cardDB 按名定位，失败即停）
+        run: python3 lab/experiments/EXP-007-new-speed/patch_exp007.py
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp007-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp007-${{ runner.os }}-
+            lab-sync-260901-${{ runner.os }}-
+      - name: Build bench
+        run: cargo build --release -p umasim --bin ramen_space_bench
+      - name: Run expanded-space bench (1246 plans × 8)
+        run: |
+          mkdir -p experiment_output
+          ./target/release/ramen_space_bench --trainer handwritten \
+            --runs-per-plan 8 --seed 61444 \
+            --deck-file experiment_output/deck8_exp007.txt \
+            --csv experiment_output/exp007_full.csv 2>&1 | tail -50
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-007-full
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  summary:
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/download-artifact@v4
+        with:
+          name: EXP-007-full
+          path: downloaded
+      - name: 逐卡边际归因 + 阵营配对裁决
+        run: |
+          python3 - <<'PY'
+          import csv, glob, json, math
+          from collections import defaultdict
+
+          hits = glob.glob("downloaded/**/exp007_full.csv", recursive=True)
+          assert hits, "缺 exp007_full.csv"
+          rows = list(csv.DictReader(open(hits[0], newline="")))
+          n = len(rows)
+          mf = json.load(open(glob.glob("downloaded/**/card_manifest.json", recursive=True)[0]))
+          NEW = [c["idrank"] for c in mf["new"]]
+          NAME = {c["idrank"]: c["name"] for c in mf["new"]}
+          OLD = [c["idrank"] for c in mf["known_speed"]]
+          friend = mf["friend"]
+          print(f"行数 {n}；新卡 {[NAME[i] for i in NEW]}")
+
+          # ===== 阈值校验：Y1 不吃面局 =====
+          BAD = [r for r in rows if int(r["eat_count_y1"]) == 0]
+          print(f"Y1 吃面=0 局数: {len(BAD)} / {n}（阈值 ≤50 且显著 <21% 才算修好）")
+          if BAD:
+              bs = [float(r["score"]) for r in BAD]
+              print(f"  这些局均分 {sum(bs)/len(bs):.0f}")
+
+          # ===== 按 deck（uma|shape|deck6）聚合 =====
+          decks = defaultdict(list)
+          for r in rows:
+              decks[r["build"]].append(r)
+          print(f"副卡组数 {len(decks)}（期望 1246）")
+          assert len(decks) == 1246, f"卡组数 {len(decks)} ≠ 1246——patch 未生效或池子没扩"
+          dstat = {}
+          for b, rs in decks.items():
+              assert len(rs) == 8
+              uma, shape, dk = b.split("|")
+              cards = dk.split("-")
+              assert cards[5] == friend
+              sc = [float(r["score"]) for r in rs]
+              m = sum(sc) / 8
+              sd = (sum((x - m) ** 2 for x in sc) / 7) ** 0.5
+              dstat[b] = {
+                  "uma": uma, "shape": shape, "cards": cards, "m": m, "se": sd / math.sqrt(8),
+                  "pt": sum(int(r["skill_pt"]) for r in rs) / 8,
+                  "five": [sum(int(r[c]) for r in rs) / 8 for c in
+                           ["speed", "stamina", "power", "guts", "wisdom"]]
+              }
+
+          # ===== 保真闸：不含新卡的卡组 = 恰好 gen1 的 525 副（同种子）⇒ 必须逐位复现 65438.2 =====
+          old_decks = [b for b, d in dstat.items() if not any(c in NEW for c in d["cards"])]
+          print(f"\n不含新卡的卡组数 {len(old_decks)}（应=525）")
+          assert len(old_decks) == 525, "旧 525 副没对上——枚举改动异常"
+          old_mean = sum(dstat[b]["m"] for b in old_decks) / len(old_decks)
+          print(f"旧525副均分 {old_mean:.1f}（保真目标 65438.2，容差 ±1）")
+          assert abs(old_mean - 65438.2) < 1.0, f"旧卡组复现失败: {old_mean}"
+
+          # ===== 阵营对照（按新卡在不在卡组）=====
+          camp = defaultdict(list)
+          for b, d in dstat.items():
+              has = [c for c in NEW if c in d["cards"]]
+              key = "+".join(NAME[c] for c in has) if has else "旧6卡"
+              camp[key].append(b)
+          print("\n===== 阵营对照（卡组级）=====")
+          for key, bs in sorted(camp.items(), key=lambda x: -len(x[1])):
+              m = sum(dstat[b]["m"] for b in bs) / len(bs)
+              pt = sum(dstat[b]["pt"] for b in bs) / len(bs)
+              fs = [sum(dstat[b]["five"][i] for b in bs) / len(bs) for i in range(5)]
+              print(f"{key:<10} 副={len(bs):4}  mean={m:8.1f}  PT={pt:6.0f}  "
+                    f"速={fs[0]:.0f} 耐={fs[1]:.0f} 力={fs[2]:.0f} 根={fs[3]:.0f} 智={fs[4]:.0f}")
+
+          # ===== 配对裁决：同 (uma,shape) 格内，含新卡 vs 旧6卡 的均分差 =====
+          cell = defaultdict(dict)
+          for b, d in dstat.items():
+              has = tuple(c for c in NEW if c in d["cards"])
+              key = "+".join(NAME[c] for c in has) if has else "old"
+              cell[(d["uma"], d["shape"])][key] = d["m"]
+          print("\n===== 配对裁决（(uma,shape) 格内配对）=====")
+          verdicts = {}
+          for key in [k for k in camp if k != "旧6卡"]:
+              ds = [(v[key] - v["old"]) for v in cell.values() if "old" in v and key in v]
+              if len(ds) < 2:
+                  print(f"{key}: 配对格不足")
+                  continue
+              d = sum(ds) / len(ds)
+              sd = (sum((x - d) ** 2 for x in ds) / (len(ds) - 1)) ** 0.5
+              t = d / (sd / math.sqrt(len(ds))) if sd > 0 else 0.0
+              verdict = "✅ 更强" if (d > 0 and t >= 2) else "❌ 更弱" if (d < 0 and t <= -2) else "≈ 平"
+              verdicts[key] = (d, t)
+              print(f"{key:<10} Δ={d:+7.1f}  t={t:+5.2f}  over {len(ds)} 格  {verdict}")
+
+          # ===== 老卡边际画像：每张老速卡 在场 vs 不在场（定位被新卡顶掉的是谁）=====
+          print("\n===== 老速卡边际画像（在/不在场均分差，负=拖后腿）=====")
+          for oc in OLD:
+              inn = [dstat[b]["m"] for b, d in dstat.items() if oc in d["cards"]]
+              out = [dstat[b]["m"] for b, d in dstat.items() if oc not in d["cards"]]
+              mi, mo = sum(inn) / len(inn), sum(out) / len(out)
+              print(f"{NAME[oc]:<28} 在场 {mi:8.1f}（{len(inn):4} 副）  不在场 {mo:8.1f}（{len(out):4} 副）  Δ={mi-mo:+7.1f}")
+
+          winners = [k for k, (d, t) in verdicts.items() if d > 0 and t >= 2]
+          print("\n===== 结论 =====")
+          if winners:
+              best = max(winners, key=lambda k: verdicts[k][0])
+              print(f"更强的新卡: {best}（Δ{verdicts[best][0]:+.1f} t{verdicts[best][1]:+.2f}）")
+              print("下一步: 从旧池剔除边际最差老卡 + 放入该新卡，重跑 525 空间细扫")
+          else:
+              print("新卡均未显著超过旧6卡 → 不替换，gen1 池维持")
+
+          with open("SUMMARY.txt", "w") as f:
+              f.write(f"n={n} decks={len(decks)} Y1_eat0={len(BAD)} old525_mean={old_mean:.1f}\n")
+              for key, bs in camp.items():
+                  m = sum(dstat[b]["m"] for b in bs) / len(bs)
+                  f.write(f"camp {key}: decks={len(bs)} mean={m:.1f}\n")
+              for key, (d, t) in verdicts.items():
+                  f.write(f"paired {key}: d={d:+.1f} t={t:+.2f}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-007-summary
+          path: SUMMARY.txt
+          retention-days: 30
