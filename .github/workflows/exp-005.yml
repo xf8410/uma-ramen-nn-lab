@@ -40,13 +40,22 @@ jobs:
           restore-keys: |
             lab-exp-${{ runner.os }}-
             lab-smoke-${{ runner.os }}-
-      - name: Download gamedata (必需)
+      - name: Cache gamedata
+        uses: actions/cache@v4
+        with:
+          path: gamedata
+          key: gamedata-xulai1001-master-20260902
+      - name: Download gamedata (必需；缓存命中则跳过；curl 带重试防 80 路并发抖动)
         run: |
-          mkdir -p gamedata
-          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
-          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
-            curl -sSL "$BASE/$f" -o "gamedata/$f" || exit 1
-          done
+          if [ -f gamedata/constants.json ] && [ -f gamedata/cardDB.json ] && [ -f gamedata/umaDB.json ] && [ -f gamedata/text_data_dict.json ] && [ -f gamedata/events.json ] && [ -f gamedata/scenario_ramen.json ] && [ -f gamedata/scenario_onsen.json ] && [ -f gamedata/default_config.toml ]; then
+            echo "gamedata 缓存命中，跳过下载"
+          else
+            mkdir -p gamedata
+            BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
+            for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+              curl -sSL --retry 5 --retry-delay 5 --retry-all-errors "$BASE/$f" -o "gamedata/$f" || exit 1
+            done
+          fi
       - name: Collect sn64 shard ${{ matrix.shard }}
         run: bash "lab/experiments/EXP-005-recollection-sn64/run.sh" ${{ matrix.shard }}
       - name: Upload shard artifact
@@ -139,13 +148,22 @@ jobs:
           restore-keys: |
             lab-exp-${{ runner.os }}-
             lab-smoke-${{ runner.os }}-
-      - name: Download gamedata (必需)
+      - name: Cache gamedata
+        uses: actions/cache@v4
+        with:
+          path: gamedata
+          key: gamedata-xulai1001-master-20260902
+      - name: Download gamedata (必需；缓存命中则跳过；curl 带重试)
         run: |
-          mkdir -p gamedata
-          BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
-          for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
-            curl -sSL "$BASE/$f" -o "gamedata/$f" || exit 1
-          done
+          if [ -f gamedata/constants.json ] && [ -f gamedata/cardDB.json ] && [ -f gamedata/umaDB.json ] && [ -f gamedata/text_data_dict.json ] && [ -f gamedata/events.json ] && [ -f gamedata/scenario_ramen.json ] && [ -f gamedata/scenario_onsen.json ] && [ -f gamedata/default_config.toml ]; then
+            echo "gamedata 缓存命中，跳过下载"
+          else
+            mkdir -p gamedata
+            BASE=https://raw.githubusercontent.com/xulai1001/umaai-rs/master/gamedata
+            for f in constants.json cardDB.json umaDB.json text_data_dict.json events.json scenario_ramen.json scenario_onsen.json default_config.toml; do
+              curl -sSL --retry 5 --retry-delay 5 --retry-all-errors "$BASE/$f" -o "gamedata/$f" || exit 1
+            done
+          fi
       - name: Download EXP-005 dataset
         uses: actions/download-artifact@v4
         with:
