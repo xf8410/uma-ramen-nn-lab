@@ -1,0 +1,197 @@
+name: EXP-007 新速度卡对比（乐透心 × 千名代表，全空间 1246×8=9968 局）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply EXP-007 patch（速卡池 6→8，cardDB 按名定位，失败即停）
+        run: python3 lab/experiments/EXP-007-new-speed/patch_exp007.py
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp007-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp007-${{ runner.os }}-
+            lab-sync-260901-${{ runner.os }}-
+      - name: Build bench
+        run: cargo build --release -p umasim --bin ramen_space_bench
+      - name: Run expanded-space bench (1246 plans × 8)
+        run: |
+          mkdir -p experiment_output
+          ./target/release/ramen_space_bench --trainer handwritten \
+            --runs-per-plan 8 --seed 61444 \
+            --deck-file experiment_output/deck8_exp007.txt \
+            --csv experiment_output/exp007_full.csv 2>&1 | tail -50
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-007-full
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  summary:
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/download-artifact@v4
+        with:
+          name: EXP-007-full
+          path: downloaded
+      - name: 逐卡边际归因 + 阵营对照 + 阈值校验
+        run: |
+          python3 - <<'PY'
+          import csv, glob, json, math, sys
+          from collections import defaultdict
+
+          hits = glob.glob("downloaded/**/exp007_full.csv", recursive=True)
+          assert hits, "缺 exp007_full.csv"
+          rows = list(csv.DictReader(open(hits[0], newline="")))
+          n = len(rows)
+          mf = json.load(open(glob.glob("downloaded/**/card_manifest.json", recursive=True)[0]))
+          new_ids = [c["idrank"] for c in mf["new"]]
+          new_names = {c["idrank"]: c["name"] for c in mf["new"]}
+          friend = mf["friend"]
+          print(f"行数 {n}；新卡 {new_ids}")
+
+          # ===== 局内阈值校验 =====
+          BAD = [r for r in rows if int(r["eat_count_y1"]) == 0]
+          print(f"Y1 吃面=0 局数: {len(BAD)}（阈值 ≤50 且 ≪21% 才算修好）")
+          if BAD:
+              bad_scores = [float(r["score"]) for r in BAD]
+              print(f"  这些局均分 {sum(bad_scores)/len(bad_scores):.0f}（若显著低→Y1 不吃面是真损伤）")
+
+          # ===== 保真闸（口径=EXP-SYNC-260901 判定的 65438.2）=====
+          build = "65438.2"
+
+          # ===== 按 (uma, shape) 聚合，deck 互相排除 =====
+          groups = defaultdict(list)
+          for r in rows:
+              parts = r["build"].split("|")
+              assert len(parts) == 3, f"build 列不是 uma|shape|deck: {r['build']}"
+              groups[(parts[0], parts[1])].append(r)
+          print(f"(uma,shape) 组数 {len(groups)}（期望 21 = 7×3）")
+          assert len(groups) == 21
+
+          M = [0.0] * 5
+          rown = 0
+          for (uma, shape), rs in sorted(groups.items()):
+              k = len(rs)
+              assert k == 8, f"({uma},{shape}) 局数 {k} ≠ 8"
+              rown += k
+              decks = set(r["build"].split("|")[2] for r in rs)
+              assert len(decks) == 1, f"({uma},{shape}) 混入多副卡组"
+              deck = decks.pop().split("-")
+              assert deck[5] == friend, f"友人卡位异常: {deck[5]}"
+              has = [c for c in new_ids if c in deck]
+              sc = [float(r["score"]) for r in rs]
+              m = sum(sc) / k
+              sd = (sum((x - m) ** 2 for x in sc) / (k - 1)) ** 0.5
+              se = sd / math.sqrt(k)
+              pt = sum(int(r["skill_pt"]) for r in rs) / k
+              fs = [sum(int(r[c]) for r in rs) / k for c in
+                    ["speed", "stamina", "power", "guts", "wisdom"]]
+              tag = ("+" + "+".join(new_names[c] for c in has)) if has else "旧6卡"
+              tag_short = "+乐" if new_ids[0] in deck and new_ids[1] not in deck else \
+                          "+千" if new_ids[1] in deck and new_ids[0] not in deck else \
+                          "+乐+千" if len(has) == 2 else "旧6卡"
+              print(f"uma={uma} {shape:<16} {tag_short:<6} n={k} mean={m:8.1f}±{se:5.1f} "
+                    f"PT={pt:6.0f} 五维=[{fs[0]:.0f},{fs[1]:.0f},{fs[2]:.0f},{fs[3]:.0f},{fs[4]:.0f}]")
+              M = [a + b for a, b in zip(M, fs)]
+          assert rown == n
+
+          # ===== 按「新卡是否在卡组」分阵营（组内互相排除 ⇒ 无混杂）=====
+          camp = defaultdict(list)
+          for (uma, shape), rs in groups.items():
+              deck = rs[0]["build"].split("|")[2].split("-")
+              has = [c for c in new_ids if c in deck]
+              key = "+".join(new_names[c] for c in has) if has else "旧6卡"
+              camp[key].extend(rs)
+          print("\n===== 阵营对照（同一 (uma,shape) 内卡组互斥，无混杂）=====")
+          stats = {}
+          for key, rs in sorted(camp.items(), key=lambda x: -len(x[1])):
+              k = len(rs)
+              sc = [float(r["score"]) for r in rs]
+              m = sum(sc) / k
+              sd = (sum((x - m) ** 2 for x in sc) / (k - 1)) ** 0.5
+              se = sd / math.sqrt(k)
+              pt = sum(int(r["skill_pt"]) for r in rs) / k
+              fs = [sum(int(r[c]) for r in rs) / k for c in
+                    ["speed", "stamina", "power", "guts", "wisdom"]]
+              stats[key] = (m, se, k, pt, fs)
+              print(f"{key:<12} n={k:4}  mean={m:8.1f}±{se:5.1f}  PT={pt:6.0f}  "
+                    f"速={fs[0]:.0f} 耐={fs[1]:.0f} 力={fs[2]:.0f} 根={fs[3]:.0f} 智={fs[4]:.0f}")
+
+          # ===== 阵营间配对 t（重叠 (uma,shape) 格内两两差）=====
+          keys = [k for k in stats if k != "旧6卡"]
+          if "旧6卡" in stats:
+              for key in keys:
+                  ds = []
+                  for (uma, shape), rs in groups.items():
+                      deck = rs[0]["build"].split("|")[2].split("-")
+                      has = [c for c in new_ids if c in deck]
+                      k2 = "+".join(new_names[c] for c in has) if has else "旧6卡"
+                      if k2 == key:
+                          new_m = sum(float(r["score"]) for r in rs) / len(rs)
+                          old = groups_orig[(uma, shape)]
+                          ds.append(new_m - old)
+                  if len(ds) >= 2:
+                      d = sum(ds) / len(ds)
+                      sd = (sum((x - d) ** 2 for x in ds) / (len(ds) - 1)) ** 0.5
+                      t = d / (sd / math.sqrt(len(ds))) if sd > 0 else 0.0
+                      print(f"配对差 {key}: Δ={d:+.1f} t={t:+.2f} over {len(ds)} 组")
+
+          # ===== 胜负判定 =====
+          old = stats.get("旧6卡")
+          if old:
+              print(f"\n判定基准（旧6卡）: {old[0]:.1f}±{old[1]:.1f}")
+              best = max(keys, key=lambda k: stats[k][0]) if keys else None
+              for key in keys:
+                  m, se, k, _, _ = stats[key]
+                  diff = m - old[0]
+                  t = diff / math.sqrt(old[1]**2 + se**2) if (old[1] + se) > 0 else 0
+                  verdict = "✅ 更强（≥2σ）" if (diff > 0 and t >= 2) else \
+                            "❌ 更弱（≤−2σ）" if (diff < 0 and t <= -2) else "≈ 平（|t|<2）"
+                  print(f"vs {key:<10}: {diff:+8.1f}  t={t:+5.2f}  {verdict}")
+              if best and (stats[best][0] - old[0]) > 0:
+                  print(f"\n最优候选: {best}（Δ{stats[best][0]-old[0]:+.1f}）→ 细扫 = 从旧池去掉最弱速卡+放入该卡")
+          else:
+              print("缺旧6卡阵营")
+
+          with open("SUMMARY.txt", "w") as f:
+              f.write(f"n={n} groups={len(groups)} Y1_eat0={len(BAD)}\n")
+              for key, (m, se, k, pt, fs) in stats.items():
+                  f.write(f"{key}: n={k} mean={m:.1f}±{se:.1f} pt={pt:.0f} five={[round(x) for x in fs]}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-007-summary
+          path: SUMMARY.txt
+          retention-days: 30
