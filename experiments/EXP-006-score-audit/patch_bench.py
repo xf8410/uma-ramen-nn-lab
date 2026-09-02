@@ -5,7 +5,8 @@
 （"算两遍"），逐局断言与模拟器结算一致，排除任何重复计分/漏计。
 
 补丁对象：upstream pin 43f532c 的 crates/umasim/src/bench.rs。
-四处精确替换，每处断言恰好出现一次；任何失配立即失败（防 pin 漂移）。
+五处精确替换，每处断言恰好出现一次；任何失配立即失败（防 pin 漂移）。
+（第 5 处：RESULTS_HEADER 数组声明长度 31→33，漏改会 E0308。）
 """
 from pathlib import Path
 import sys
@@ -35,7 +36,7 @@ REPLACEMENTS = [
         total_hints: game.uma.total_hints,
 """,
     ),
-    # 3) CSV 表头扩列（31 → 33）
+    # 3) CSV 表头扩列
     (
         """    "skill_pt",
 """,
@@ -53,6 +54,13 @@ REPLACEMENTS = [
         outcome.total_hints.to_string(),
 """,
     ),
+    # 5) 数组声明长度同步（31 → 33；漏改 = E0308）
+    (
+        """pub const RESULTS_HEADER: [&str; 31] = [
+""",
+        """pub const RESULTS_HEADER: [&str; 33] = [
+""",
+    ),
 ]
 
 
@@ -65,7 +73,7 @@ def main() -> int:
             return 1
         text = text.replace(old, new)
     TARGET.write_text(text, encoding="utf-8")
-    print("PATCH OK: bench.rs +skill_score +total_hints（结构体/构造/表头/落列 共 4 处）")
+    print("PATCH OK: bench.rs +skill_score +total_hints（结构体/构造/表头/落列/数组长度 共 5 处）")
     return 0
 
 
