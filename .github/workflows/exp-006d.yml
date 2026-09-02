@@ -86,7 +86,6 @@ jobs:
 
           VARIANTS = ["base", "ck20", "ck40", "cook60", "cook80", "g280", "g2110",
                       "g320", "g280-g320", "g2110-g320", "ck20-cook60", "ck20-cook80"]
-          YEAR_END = [23, 47, 71]
           RMJ_NEED = [1500, 3000, 5000]  # 第 3 年 3500 成功 / 5000 大成功
 
           def load(v):
@@ -112,10 +111,13 @@ jobs:
               pts = [int(r[key]) for r in base]
               pm = sum(pts) / n
               over = sum(p - RMJ_NEED[y] for p in pts if p > RMJ_NEED[y]) / n
-              hit = sum(1 for p in pts if (p >= (5000 if y == 2 else RMJ_NEED[y]))) / n * 100
-              great = sum(1 for p in pts if y == 2 and p >= 5000) / n * 100 if y == 2 else float("nan")
-              print(f"Y{y+1}: PT均值 {pm:.0f} / 阈值 {RMJ_NEED[y]}（Y3大成功线5000）  超出量均值 {over:.0f}  达标率 {hit:.1f}%"
-                    + (f"  大成功率 {great:.1f}%" if y == 2 else ""))
+              threshold = 5000 if y == 2 else RMJ_NEED[y]
+              hit = sum(1 for p in pts if p >= threshold) / n * 100
+              great = sum(1 for p in pts if y == 2 and p >= 5000) / n * 100 if y == 2 else None
+              line = f"Y{y+1}: PT均值 {pm:.0f} / 阈值 {threshold}  超出量均值 {over:.0f}  达标率 {hit:.1f}%"
+              if great is not None:
+                  line += f"  大成功率 {great:.1f}%"
+              print(line)
           eat = [sum(int(r[f"eat_count_y{y+1}"]) for y in range(3)) for r in base]
           print(f"三年吃面次数均值 {sum(eat)/n:.1f}")
           for y in range(3):
