@@ -1,0 +1,161 @@
+name: EXP-008b 蒸馏 v2 闭环复裁决（EXP-008 冠军教师模型 × 手写双口径）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+  MODEL_RUN_ID: "33704316342"
+
+jobs:
+  # 6 组并行：手写默认 + 手写冠军 + 3 个 NN 种子 + NN 冠军对照臂占位（seed0830 复跑一次同一模型，验证 artifact 读取稳定性）
+  # 口径与 EXP-004/004b 完全一致：525 计划 × 8 局 = 4200 局/组，seed 61444，race_shield on，canonical
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: hw-default
+            trainer: handwritten
+            variant: base
+          - id: hw-champion
+            trainer: handwritten
+            variant: g2420-o2150-o3150-g3160-cook60
+          - { id: nn-seed20260830, trainer: nn, seed: "20260830" }
+          - { id: nn-seed20260831, trainer: nn, seed: "20260831" }
+          - { id: nn-seed20260832, trainer: nn, seed: "20260832" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply 006c→d→e→fix patch 链（冠军变体 token 需要）
+        run: |
+          python3 lab/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e_fix.py
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp008b-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp008b-${{ runner.os }}-
+            lab-exp008-${{ runner.os }}-
+      - name: Download model (NN 组，来自 EXP-008 训练 run)
+        if: matrix.trainer == 'nn'
+        uses: actions/download-artifact@v4
+        with:
+          name: EXP-008-model-seed${{ matrix.seed }}
+          path: models/seed${{ matrix.seed }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.MODEL_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: Build bench（feature onnx，NN 组需要）
+        run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
+      - name: Run bench (${{ matrix.id }})
+        run: |
+          mkdir -p experiment_output
+          ARGS="--runs-per-plan 8 --seed 61444 --csv experiment_output/exp008b_${{ matrix.id }}.csv"
+          if [ "${{ matrix.trainer }}" = "nn" ]; then
+            ./target/release/ramen_space_bench --trainer nn \
+              --model "models/seed${{ matrix.seed }}/model.onnx" $ARGS 2>&1 | tail -45
+          else
+            ./target/release/ramen_space_bench --trainer handwritten \
+              --variant "${{ matrix.variant }}" $ARGS 2>&1 | tail -45
+          fi
+      - name: Upload bench artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-008b-${{ matrix.id }}
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  # 配对裁决：手写默认（65438.2 应逐位复现）+ 手写冠军（≈65554.2 应逐位复现）双口径
+  # 判据（§0.4）：t>2 且 Δ>0 才判 NN 超该口径
+  summary:
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-008b-*
+          path: downloaded
+          merge-multiple: false
+      - name: 双口径配对裁决（全列报告）
+        run: |
+          python3 - <<'PY'
+          import csv, glob, math, os
+
+          FIVE = ["speed", "stamina", "power", "guts", "wisdom"]
+
+          def load(tag):
+              hits = glob.glob(f"downloaded/EXP-008b-{tag}/**/exp008b_{tag}.csv", recursive=True)
+              assert hits, f"缺 {tag} 的 CSV"
+              return list(csv.DictReader(open(hits[0], newline="")))
+
+          def stats(rows):
+              s = [float(r["score"]) for r in rows]
+              n = len(s)
+              mean = sum(s) / n
+              sd = (sum((x - mean) ** 2 for x in s) / (n - 1)) ** 0.5
+              return s, n, mean, sd / math.sqrt(n)
+
+          hw_def = load("hw-default")
+          base_scores, n, base_mean, base_se = stats(hw_def)
+          seeds = [r["seed"] for r in hw_def]
+          hwd_fail = sum(r["free_race_ok"] == "0" for r in hw_def)
+          print(f"手写默认 (base): n={n} mean={base_mean:.1f} se={base_se:.1f} 自选未达标={hwd_fail}")
+          print(f"  保真锚检查: 期望 65438.2 ± 4×54.5（±218）逐位复现或极近")
+
+          hw_ch = load("hw-champion")
+          assert [r["seed"] for r in hw_ch] == seeds, "冠军臂 seed 流不一致"
+          ch_scores, nch, ch_mean, ch_se = stats(hw_ch)
+          ch_fail = sum(r["free_race_ok"] == "0" for r in hw_ch)
+          chd = [a - b for a, b in zip(ch_scores, base_scores)]
+          ch_d = sum(chd) / n
+          ch_t = ch_d / ((sum((x - ch_d) ** 2 for x in chd) / (n - 1)) ** 0.5 / math.sqrt(n))
+          print(f"手写冠军 (g2420-o2150-o3150-g3160-cook60): mean={ch_mean:.1f} se={ch_se:.1f} 自选未达标={ch_fail}")
+          print(f"  vs 默认 配对 Δ={ch_d:+.1f} t={ch_t:+.2f}（EXP-006k 应复现 +116.1 t+5.91）")
+
+          print(f"\n{'组':<20} {'均分':>8} {'Δ vs 默认':>10} {'t':>8} {'Δ vs 冠军':>10} {'t':>8}  判定")
+          for tag in ["nn-seed20260830", "nn-seed20260831", "nn-seed20260832"]:
+              rows = load(tag)
+              assert len(rows) == n, f"{tag}: 行数 {len(rows)} != {n}"
+              assert [r["seed"] for r in rows] == seeds, f"{tag}: seed 列与手写不逐行一致，配对失效"
+              s, _, m, se = stats(rows)
+              fail = sum(r["free_race_ok"] == "0" for r in rows)
+              d1 = [a - b for a, b in zip(s, base_scores)]
+              d2 = [a - b for a, b in zip(s, ch_scores)]
+              m1 = sum(d1) / n; t1 = m1 / ((sum((x - m1) ** 2 for x in d1) / (n - 1)) ** 0.5 / math.sqrt(n))
+              m2 = sum(d2) / n; t2 = m2 / ((sum((x - m2) ** 2 for x in d2) / (n - 1)) ** 0.5 / math.sqrt(n))
+              v1 = "超默认 ✅" if (t1 > 2 and m1 > 0) else "未超默认"
+              v2 = "超冠军 ✅" if (t2 > 2 and m2 > 0) else "未超冠军"
+              print(f"{tag:<20} {m:>8.1f} {m1:>+10.1f} {t1:>+8.2f} {m2:>+10.1f} {t2:>+8.2f}  {v1} / {v2}")
+
+          print("\n历史对照链（教师=默认 preset 口径）: gen1(sn8) Δ=−5516/−7893/−9514 → gen2(sn64) Δ=−1139/−2224/−613")
+          print("本轮教师=冠军配方（65554 档）：若 NN 贴近甚至越过 65554 即蒸馏 v2 成功；70000 线为下一程目标")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-008b-summary
+          path: SUMMARY.txt
+          retention-days: 30
+          if-no-files-found: error
