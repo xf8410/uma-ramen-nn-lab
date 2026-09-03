@@ -1,0 +1,75 @@
+name: EXP-009 蒸馏 v3 冒烟（160k 口径管线验证：patch 链 + CHUNK=2000 采 20 条）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply 006c→d→e→fix→008 patch 链（教师=冠军配方）
+        run: |
+          python3 lab/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e_fix.py
+          python3 lab/experiments/EXP-008-distill-v2/patch_exp008.py
+      - name: Patch 自检
+        run: grep -n 'with_tokens("g2420-o2150-o3150-g3160-cook60")' crates/umasim/src/search/searchable.rs
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp009-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp009-${{ runner.os }}-
+            lab-exp008-${{ runner.os }}-
+      - name: Build teacher_collect
+        run: cargo build --release -p umasim --bin ramen_teacher_collect
+      - name: Smoke 采 20 条（shard 0 × CHUNK=20，验证 run.sh 新参数）
+        run: |
+          mkdir -p experiment_output
+          bash lab/experiments/EXP-009-distill-v3/run.sh 0 20
+      - name: Manifest 断言（160k 口径：index_end 应=20，区间语义同 008）
+        run: |
+          python3 - <<'PY'
+          import json
+          m = json.load(open("experiment_output/shard_0/manifest.json"))
+          assert m["search_n"] == 64, m["search_n"]
+          assert m["index_start"] == 0 and m["index_end"] == 20, (m["index_start"], m["index_end"])
+          assert m["finished_at"], "未完成"
+          assert m["git_commit"] == "d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1", m["git_commit"]
+          assert m["premises"]["record_ordered_rollouts"] is True
+          assert m["premises"]["use_ucb"] is False
+          assert abs(m["premises"]["radical_factor_max"] - 1.4) < 1e-9
+          assert m["premises"]["ramen_region_strategy"] in ("All", "all"), m["premises"]["ramen_region_strategy"]
+          print(f"SMOKE MANIFEST OK: accepted={m['accepted']} skipped={m['skipped_uncaptured']} recipe={m['recipe_hash_fnv1a64'][:16]}")
+          print("与 EXP-008 smoke 的 recipe_hash 应逐位相同（教师/采样器/前提全同，仅 CHUNK 不同不进 recipe）")
+          print(f"sampler snapshot: {m['sampler']}")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-009-smoke
+          path: experiment_output/
+          retention-days: 14
+          if-no-files-found: error
