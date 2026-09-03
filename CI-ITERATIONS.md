@@ -1,55 +1,87 @@
-# CI 迭代记录（EXP-001 → EXP-006l）
+# NN 迭代记录（uma-ramen-nn-lab 全过程）
 
-> 本仓对上游只读（`muxueliunian/umaai-rs-muxue@feat/ramen-nn-schema`，checkout 锁 SHA）。所有改动以 patch 方式在 CI 内注入，不维护 fork 副本。本文档面向外部读者，汇总自 2026-09-01 建仓起的全部 CI 迭代；每次实验的 workflow 文件、验证内容与结论均可在本仓 Actions 历史按 workflow 名检索。
+> 手写策略的 44+ 代权重迭代（v2–v65 工作流、handoff 文档）已在 xulai1001/umaai-rs 上游合并，不在本文范围。本仓记录的是其之后的**两条新线**：**A. NN 蒸馏线**（把手写教师蒸馏成网络，EXP-001→005，本文主体）与 **B. 手写教师继续调优线**（EXP-006 系列，为蒸馏提供更强的教师）。
+>
+> 本仓对上游只读（checkout 锁 SHA `feat/ramen-nn-schema`），所有改动以 patch 注入 CI；每轮实验 = patch(.py) + workflow(.yml) + plan/results(.md) + Actions run，四件套全在本仓。
 
-## 0. 门禁与基础设施
+## 第 0 步：锚点与门禁（EXP-001）
 
-- `lab.yml`（PR / push 门禁）：cargo check（default + onnx features）+ release bins 构建 + pytest（scripts/ramen_nn 测试）。三轮定型：
-  1. setup-rust-toolchain 注入 `-D warnings` → 上游 onnx 预留接口（leaf_nn / simulate_until_terminal_or_leaf / SimOutcome）3 处 dead_code 误红 → 改用 dtolnay toolchain（不注入 RUSTFLAGS）
-  2. 上游全套 cargo test 不适合作门禁：断言绑定本地 gamedata 逐位基线（如 mean=63471.125），外部数据源与上游 feat 分支有漂移即假红；且 debug profile 下 330 个整局测试远超冒烟窗口
-  3. 定型：check + bins + pytest，1m19s 通过
-- 上游 gamedata 入库前（43f532c）CI 从 xulai1001/umaai-rs master raw 下载；d27a6eb 起数据已在树内，直接用 pinned 数据
+- 旧管线 checkpoint/数据未留存，从零重建。`lab.yml` 门禁三轮定型：cargo check(default+onnx) + release bins + pytest（详见 git log 7e685f58 → 9677b2a9 的复盘：toolchain `-D warnings` 误红、上游 cargo test 绑定本地 gamedata 逐位断言不可用作门禁）
+- **base 4200 局 mean = 65438.2**（seed 61444 世界，三重复现 sd=54.5）——此后所有轮次的逐位保真锚
 
-## 1. 实验总表
+## 第 1 步：教师数据采集管线（EXP-002）
 
-| 实验 | workflow 文件 | 验证内容 | 结论 |
-|---|---|---|---|
-| EXP-001a | exp-001a.yml | 手写基线锚点重测（旧管线 checkpoint/数据未留存，从零采） | base 4200 局 mean = 65438.2（三重复现，sd=54.5），定为全项目锚点 |
-| EXP-002 | exp-002.yml | 教师采数试点 | 采数链路可用；单 job 拉满 30GB 磁盘事故复盘见 [INCIDENT-20260902.md](EXP-002-teacher-pilot/INCIDENT-20260902.md)，由此确立"三步验证"准则 |
-| EXP-003 | exp-003.yml | NN 训练 v1（teacher → train.py → ONNX） | 首个模型产出，见 [results.md](EXP-003-train-v1/results.md) |
-| EXP-003b | exp-003b.yml | 训练退化排查 | 见 [results.md](EXP-003b-degrade-investigation/results.md)（该 workflow 无 dispatch 输入，push 事件显示 failure 属预期，不影响门禁） |
-| EXP-004 / 004b | exp-004.yml / exp-004b.yml | NN leaf evaluator 进 MCTS 闭环 | 见 [results.md](EXP-004-closed-loop/results.md) |
-| EXP-005 | exp-005.yml | search_n=64 重回忆对比 | 见 [results.md](EXP-005-recollection-sn64/results.md) |
-| EXP-006 score-audit | exp-006-audit.yml | 评分口径审计（skill_score / PT×2 / 五维凸表与 calc_score 对齐） | bench 口径与游戏评分公式逐项核对通过 |
-| EXP-006 fork-baseline | exp-006b-fork.yml | 接入 ramen_space_bench + 手写/推荐双基线 | 确立 4200 局同 seed 世界配对方法学（单局口径手写 47796 vs 推荐 58380） |
-| EXP-006c | exp-006c.yml | 引入"缺哪补哪"力度旋钮（dynamic status balance gap 缩放） | 正收益，方向确立 |
-| EXP-006d | exp-006d.yml | 三年分治（pt_rate=16/64/64；Y3 vital_rest_eating=0） | 稳定收益，成为 preset 骨架 |
-| EXP-006e | exp-006e.yml | 松油门（Y3 晚期低性价比格松门限）o1/o2/o3 | o2/o3 有增量 |
-| EXP-006f–006i | exp-006f/g/h/i.yml | 各旋钮矩阵扫描与组合收敛 | 单轮增益递减（矩阵见各 plan.md） |
-| EXP-006j | exp-006j.yml（[run 33695537770](https://github.com/xf8410/uma-ramen-nn-lab/actions/runs/33695537770)） | Y2 补短板 3.5/4.0/4.5 × Y3 复测 1.4/1.9 × 近上限衰减重测 | g2=4.2、o 系 1.5/1.5 进入拼接 |
-| EXP-006k | exp-006k.yml（[run 33696260156](https://github.com/xf8410/uma-ramen-nn-lab/actions/runs/33696260156)） | 收尾拼接 × o 配比微调 × 无 o 对照 | **冠军 65554.2（+116.1，t=+5.91）= g2420-o2150-o3150-g3160-cook60**，9/9 采纳 |
-| EXP-006l | exp-006l.yml（[run 33696850466](https://github.com/xf8410/uma-ramen-nn-lab/actions/runs/33696850466)） | 换种子 70000 泛化验证 × 终选决胜（g2 4.0/4.2、o3 1.0/1.5） | **4/4 变体全部复现；+62.3（t=+3.33）；g2 4.2>4.0、o3 1.5>1.0 → 配方定稿** |
-| EXP-SYNC-260901 | upstream-sync-260901.yml | 换 pin 43f532c → d27a6eb 保真检查 | base 4200 逐位复现 65438.2 → 数据更新未影响采样空间 |
-| EXP-007 | exp-007.yml | 新速度卡对比 | 卡名→卡 ID 定位未完成，实验搁置（patch_exp007.py 留档） |
+- 12000 条教师样本，8 shard × 1500 index 互斥区间矩阵并行；实际接受 11837 条（跳过 163 = 部分局面无合法候选，预期行为）
+- 矩阵 wall-clock **3 分 12 秒**（单 job 串行估算 26 min）——确立"矩阵分片"为标准做法
+- 两次失败都在胶水层（`--count` 语义误读、artifact 目录结构假设），采集/校验本体零事故；run 33585590880
+- 产物即上游 `teacher_collect` part 格式，`ramen_export_npy --raw` 直接消费
 
-## 2. 定稿配方（手写逻辑调优终点）
+## 第 2 步：第一代训练——劣化信号（EXP-003）
 
-RecommendedRamenTrainer 三年分治 + LocalRamenConfig 覆盖：
+- 3 种子训练：best_regret **309.7 / 327.0 / 296.4**（均 309.7），参考同协议 pilot 148.8
+- plan 预设闸门 mean>200=劣化 → **触发；按预案先查数据/标签，不下结论**
+- 训练机制本身健康：早停 103–129 ep、ONNX 对拍 <1e-4、种子间散布 ±15 正常
+- 劣化疑点按嫌疑排序：①rollout 列数太少（sn=8，bootstrap 512 draws 在 8 列上趋近 one-hot）②协议错位 ③数据分布
 
-- 三年 pt_rate = 16/64/64；vital_rest = 40/40/40；vital_rest_eating = 40/40/0（仅 Y3 吃面必成时放掉硬门限）
-- 缺哪补哪力度（dynamic balance gap 缩放）：Y2 = 4.2、Y3 = 1.6
-- 材料珍惜度 cook2 = 60
-- 松油门：o2 = 1.5、o3 = 1.5
-- 其余保持：status_reserve_max=40、max_base_score_sacrifice=140、coupling=2.0/guarantee=3.0/starve=300/pro=150、友人配额 [0,2,5]、lookahead=0（证实有害）
+## 第 3 步：归因实验（EXP-003b）——确诊 sn 列数
 
-证据链：
+- 标签统计对拍：**selector_stability 0.832 vs pilot ~0.99**（决定性差异）；value 一阶统计完全吻合（60908.8 vs 60988.1，同分布确认）——教师"哪个候选最优"在 8 列 rollout 下根本不稳定，NN 忠实学了个抖动教师
+- 剂量-响应：同区间 × sn 8/32/64，sn32/sn64 相对降幅 >10% ✅
+- **H3b 成立：rollout 列数是标签质量的决定变量**。回读 DESIGN 证实上游 pilot 用 search_n=512，我们用了 8，差 64 倍
 
-- 基线 65438.2（4200 局，seed 61444 世界，三重复现）
-- 调优后 65554.2 = **+116.1（t=+5.91）**，同世界配对
-- 换种子泛化：seed 70000 世界 **+62.3（t=+3.33），4/4 变体全部复现** → 排除过拟合
-- 对应 patch：[EXP-006-wisdom-vital/patch_exp006c.py](EXP-006-wisdom-vital/patch_exp006c.py)、[EXP-006-yearphased/patch_exp006d.py](EXP-006-yearphased/patch_exp006d.py)、[EXP-006e-power/patch_exp006e.py](EXP-006e-power/patch_exp006e.py)（+ patch_exp006e_fix.py）
+## 第 4 步：闭环裁决管线（EXP-004）——第一代 NN 的真实位置
 
-## 3. 下一步（已规划，未开工）
+- gen1 全空间 525 计划 × 8 局 = 4200 局/组，同 (计划,局) 共享种子流 → 双重配对校验；判据 t>2 且 Δ>0
+- 手写对照 65009.7（与 EXP-001 锚点 64958±137.7 交叉一致）；**NN 3 种子 −7893 / −9514 / −5516（t −80~−117）**——确定性差距，远不具备替换条件
+- 副产品：**regret → 闭环映射首次标定 ≈35–60 闭环分/regret 点**（逐决策复合放大），后续可用于预估收益
+- 闭环管线本身跑通：改哪里→训练→闭环裁决，全自动 8 分钟一轮
 
-1. preset 固化 → 蒸馏（ramen_teacher_collect 大规模采数）
-2. RL 自我对弈（蒸馏后的增益路径）
+## 第 5 步：按诊断重采重训（EXP-005）——regret 309.7 → 90.3
+
+- search_n=64 × 80000 条，80 分片矩阵 1h33m（首次 2/80 分片因 gamedata 下载抖动挂 → 加 cache+retry 后一次通过）
+- 3 种子 regret **90.8 / 96.1 / 84.0（均 90.3）**，闸门 ≤200 通过，且**超越 pilot 参考量级 148.8**
+- 归因完成：**标签质量 −203（主因，−66%）；数据量 12k→78k 仅 −16（−5%）**——继续加数据边际收益已小，下一个决定变量是**标签配方本身**
+- 收敛同步改善：早停 25–71 ep（sn8 时 103–129 ep）
+
+## 第 6 步：sn64 模型闭环复裁决（EXP-004b）
+
+- 同 EXP-004 口径换 sn64 模型：**差距大幅收窄，仍未超过手写**（判据 t>2 未达标；逐位数字在当轮 run 的 artifact/summary，workflow `exp-004b.yml`）
+- 结论：NN 已能"跟随"教师，但决策质量的剩余差距集中在标签/价值配方，非容量或数据量
+
+## 第 7 步：转向教师质量（EXP-006 系列）——"教师先修好，再蒸馏"
+
+NN 收益归因指向标签与教师决策质量后，先把手写教师本身调强（每轮 4200 局配对、base 逐位保真 65438.2 ✅）：
+
+| 轮 | 主题 | 最优采纳 | 累计 Δ |
+|---|---|---|---:|
+| 006 score-audit | 评分口径审计（skill_score/PT×2/五维凸表与 calc_score 对齐） | 逐项核对通过 | — |
+| 006b fork-baseline | bench 移植独立复测 | 与锚点一致 | — |
+| 006c | 缺哪补哪力度（分年 gap 缩放）引入 | 方向确立 | — |
+| 006d | 三年分治（pt_rate 16/64/64、Y3 吃面放门限） | +稳定收益 | — |
+| 006e | power 抑制定价（被否：P90−P10 负相关是果不是因）；g2110-cook60 | +33.2 (t2.42) | +33.2 |
+| 006f | g2 曲线上行（2.0 单调升）；cook60 定版 | +42.5 (t2.82) | +42.5 |
+| 006g | Y3 缺哪补哪 1.6 再叠 +29.8；富余回合速→耐/根/智 | +72.3 (t4.19) | +72.3 |
+| 006h | Y2 峰继续上行至 3.0；Y3 峰确认 1.6；cook50 更差 | +100.9 (t5.40) | +100.9 |
+| 006i | Y2 顶峰微扫（2.6–3.2）× Y3 重测 × cook 55/65 | g2420 定版 | +116.1 |
+| 006j | 拼接（g2420 × o 系 1.5/1.5）× 配比微调 | 拼接峰确立 | +116.1 |
+| 006k | 收尾拼接 × 无 o 对照（[run 33696260156](https://github.com/xf8410/uma-ramen-nn-lab/actions/runs/33696260156)） | **65554.2（+116.1，t+5.91）** 9/9 采纳 | +116.1 |
+| 006l | **换种子 70000 泛化**（[run 33696850466](https://github.com/xf8410/uma-ramen-nn-lab/actions/runs/33696850466)） | **4/4 复现 +62.3（t+3.33）→ 配方定稿** | +116.1 |
+
+定稿配方 = 三年分治 + Y2 缺哪补哪 4.2 / Y3 1.6 + 材料 cook 60 + 松油门 o2/o3 1.5/1.5（patch：patch_exp006c/d/e.py）
+
+## 当前位置与下一步
+
+- **NN 线结论**：管线全通（采数→训练→ONNX→闭环裁决 8 分钟/轮）；regret 已压到 90.3 且超越 pilot 量级；闭环仍差手写一截，决定变量=标签配方与教师质量，非数据量/容量
+- **手写线结论**：教师已从 65438.2 调至 65554.2（+116.1），换种子泛化通过
+- **下一步**：①定稿配方固化进 preset → ②用更强教师重采蒸馏数据（标签配方同步改进）→ ③闭环复裁决 → ④RL 自我对弈
+
+## 附：胶水层事故与纪律（6 起，供后来者避坑）
+
+1. `--count` 累计语义误读 → 区间断言拦截（闸门起效）
+2. artifact 目录结构假设 → 以实际位置定位+缺失断言
+3. artifact 名解析假设段数 → 宽松正则
+4. 80 路并发 gamedata 下载抖动 → cache+retry
+5. token 字符集与 `-` 分隔符冲突（pg-30 被拆词）→ 旋钮命名避开分隔符
+6. 幽灵红（0 秒空 jobs）→ 忽略，读 log 定位再动
+
+方法学纪律：报告数字绝不预填；闸门=严格判据（t>2 且 Δ>0）；逐位保真锚每轮复验；配对比较按世界去重。
