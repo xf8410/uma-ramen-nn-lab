@@ -1,3 +1,24 @@
+name: EXP-003b 剂量-响应汇总（收档存档版）
+
+# ⚠ 修复记录（2026-09-03，随 EXP-010 分支顺手处理）：
+# 本文件在 EXP-003b 收档时被整文件误写，YAML 文件头（name/on/jobs）全部丢失，
+# 导致此后每次 push 都出现 ".github/workflows/exp-003b.yml" named-run 秒失败红叉
+# （"workflow file is not a valid YAML"，jobs=[]，无任何脚本执行、无算力成本）。
+# 现按存档下来的汇总 step 原文重建最小合法骨架，并改为仅 workflow_dispatch 可触发。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-003b-model-*
+          path: downloaded
+          merge-multiple: false
       - name: 剂量-响应汇总
         run: |
           python3 - <<'PY'
@@ -35,3 +56,9 @@
               "\n".join(f"sn{sn}: {m:.1f}" for sn, m in means.items())
               + f"\ndrop32={drop32:.1f}% drop64={drop64:.1f}%\n")
           PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-003b-summary
+          path: SUMMARY.txt
+          retention-days: 30
+          if-no-files-found: error
