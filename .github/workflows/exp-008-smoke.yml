@@ -64,14 +64,25 @@ jobs:
           assert m["premises"]["record_ordered_rollouts"] is True
           assert m["premises"]["use_ucb"] is False
           assert abs(m["premises"]["radical_factor_max"] - 1.4) < 1e-9
-          assert m["premises"]["ramen_region_strategy"] == "All", m["premises"]["ramen_region_strategy"]
+          # 教师采集 bin 会把 ramen_region_strategy 强制为 All 并原样记录（枚举 serde 大写）
+          strat = m["premises"]["ramen_region_strategy"]
+          assert strat in ("All", "all"), f"region strategy={strat!r}"
           print(f"SMOKE MANIFEST OK: accepted={m['accepted']} skipped={m['skipped_uncaptured']} recipe={m['recipe_hash_fnv1a64'][:16]} space={str(m.get('sampling_space_hash'))[:16]}")
-          print("注意: recipe_hash 与 EXP-005 不同是预期（采样器快照不变，但教师配方在 rollout 侧——若 manifest 采样器快照一致则 index 对齐成立）")
           print(f"sampler snapshot: {m['sampler']}")
+          print("教师配方在 rollout 侧不进 manifest（recipe_hash 只含采样器/前提/维度）——对齐 EXP-005 依据=index 确定性+采样器快照一致")
           PY
-      - name: Smoke 局面统计（教师应输出冠军配方特征）
+      - name: 采样器快照与 EXP-005 对齐检查（index 对齐的关键依据）
         run: |
-          tail -30 experiment_output/env_shard_0.txt || true
+          python3 - <<'PY'
+          import json
+          m = json.load(open("experiment_output/shard_0/manifest.json"))
+          s = m["sampler"]
+          # EXP-002/005 manifest 已证实的采样器快照值（region_quota_permille=[20,30]，epsilon/min_actions/inherit/max_turn/seed_base 为默认）
+          assert s["region_quota_permille"] == [20, 30], s["region_quota_permille"]
+          print("采样器快照（应与 EXP-002/005 同值，index 含义不变）:")
+          for k, v in sorted(s.items()):
+              print(f"  {k}: {v}")
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: EXP-008-smoke
