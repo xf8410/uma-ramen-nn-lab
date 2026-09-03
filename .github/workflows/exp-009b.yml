@@ -1,0 +1,171 @@
+name: EXP-009b 蒸馏 v3 闭环复裁决（160k/ep400 × 手写双口径 × gen3 冠军参照）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+
+jobs:
+  # 6 组并行：手写默认 + 手写冠军 + 3 个 EXP-009 NN 种子 + EXP-008 0832（gen3 最优，参照臂）
+  # 口径与 EXP-004/004b/008b 完全一致：525 计划 × 8 局 = 4200 局/组，seed 61444，race_shield on，canonical
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: hw-default, trainer: handwritten, variant: base }
+          - { id: hw-champion, trainer: handwritten, variant: g2420-o2150-o3150-g3160-cook60 }
+          - { id: nn009-0830, trainer: nn, artifact: EXP-009-model-seed20260830, run_id: "33716171772" }
+          - { id: nn009-0831, trainer: nn, artifact: EXP-009-model-seed20260831, run_id: "33716171772" }
+          - { id: nn009-0832, trainer: nn, artifact: EXP-009-model-seed20260832, run_id: "33716171772" }
+          - { id: nn008-0832, trainer: nn, artifact: EXP-008-model-seed20260832, run_id: "33704316342" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply 006c→d→e→fix patch 链（冠军变体 token 需要）
+        run: |
+          python3 lab/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e_fix.py
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp009b-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp009b-${{ runner.os }}-
+            lab-exp009-${{ runner.os }}-
+      - name: Download model (${{ matrix.artifact }})
+        if: matrix.trainer == 'nn'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: models/${{ matrix.id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ matrix.run_id }}
+          github-token: ${{ github.token }}
+      - name: Build bench（feature onnx，NN 组需要）
+        run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
+      - name: Run bench (${{ matrix.id }})
+        run: |
+          mkdir -p experiment_output
+          ARGS="--runs-per-plan 8 --seed 61444 --csv experiment_output/exp009b_${{ matrix.id }}.csv"
+          if [ "${{ matrix.trainer }}" = "nn" ]; then
+            ./target/release/ramen_space_bench --trainer nn \
+              --model "models/${{ matrix.id }}/model.onnx" $ARGS 2>&1 | tail -45
+          else
+            ./target/release/ramen_space_bench --trainer handwritten \
+              --variant "${{ matrix.variant }}" $ARGS 2>&1 | tail -45
+          fi
+      - name: Upload bench artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-009b-${{ matrix.id }}
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  # 配对裁决：手写默认（65438.2）+ 手写冠军（65554.2）+ gen3 最优 nn008-0832（65669.2）三基线
+  # 判据（§0.4）：t>2 且 Δ>0 才判超
+  summary:
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-009b-*
+          path: downloaded
+          merge-multiple: false
+      - name: 三基线配对裁决（全列报告 + SUMMARY.txt 落盘）
+        run: |
+          python3 - <<'PY'
+          import csv, glob, math, os
+
+          def load(tag):
+              hits = glob.glob(f"downloaded/EXP-009b-{tag}/**/exp009b_{tag}.csv", recursive=True)
+              assert hits, f"缺 {tag} 的 CSV"
+              return list(csv.DictReader(open(hits[0], newline="")))
+
+          def stats(rows):
+              s = [float(r["score"]) for r in rows]
+              n = len(s)
+              mean = sum(s) / n
+              sd = (sum((x - mean) ** 2 for x in s) / (n - 1)) ** 0.5
+              return s, n, mean, sd / math.sqrt(n)
+
+          def paired_t(d):
+              m = sum(d) / len(d)
+              se = (sum((x - m) ** 2 for x in d) / (len(d) - 1)) ** 0.5 / math.sqrt(len(d))
+              return m, (m / se if se > 0 else 0.0)
+
+          base_rows = load("hw-default")
+          base_scores, n, base_mean, base_se = stats(base_rows)
+          seeds = [r["seed"] for r in base_rows]
+          print(f"手写默认 (base): n={n} mean={base_mean:.1f} se={base_se:.1f} 自选未达标={sum(r['free_race_ok']=='0' for r in base_rows)}")
+
+          ch_rows = load("hw-champion")
+          assert [r["seed"] for r in ch_rows] == seeds, "冠军臂 seed 流不一致"
+          ch_scores, _, ch_mean, ch_se = stats(ch_rows)
+          d, t = paired_t([a - b for a, b in zip(ch_scores, base_scores)])
+          print(f"手写冠军: mean={ch_mean:.1f} se={ch_se:.1f} vs 默认 Δ={d:+.1f} t={t:+.2f}（应复现 +116.1 t+5.91）")
+
+          ref_rows = load("nn008-0832")
+          assert [r["seed"] for r in ref_rows] == seeds, "gen3 参照臂 seed 流不一致"
+          ref_scores, _, ref_mean, ref_se = stats(ref_rows)
+          d, t = paired_t([a - b for a, b in zip(ref_scores, ch_scores)])
+          print(f"gen3 参照 nn008-0832: mean={ref_mean:.1f} se={ref_se:.1f} vs 冠军 Δ={d:+.1f} t={t:+.2f}（应复现 +115.0 t+2.18）")
+
+          lines = [
+              f"hw-default: {base_mean:.1f}",
+              f"hw-champion: {ch_mean:.1f}",
+              f"nn008-0832(ref): {ref_mean:.1f}",
+          ]
+
+          print(f"\n{'组':<14} {'均分':>8} | {'Δ默认':>8} {'t':>7} | {'Δ冠军':>8} {'t':>7} | {'Δgen3':>8} {'t':>7} | 判定")
+          means = []
+          for tag in ["nn009-0830", "nn009-0831", "nn009-0832"]:
+              rows = load(tag)
+              assert len(rows) == n, f"{tag}: 行数 {len(rows)} != {n}"
+              assert [r["seed"] for r in rows] == seeds, f"{tag}: seed 列与基线不逐行一致"
+              s, _, m, se = stats(rows)
+              means.append(m)
+              d1, t1 = paired_t([a - b for a, b in zip(s, base_scores)])
+              d2, t2 = paired_t([a - b for a, b in zip(s, ch_scores)])
+              d3, t3 = paired_t([a - b for a, b in zip(s, ref_scores)])
+              v = ("超默认✅" if (t1 > 2 and d1 > 0) else "未超默认") + " / " + \
+                  ("超冠军✅" if (t2 > 2 and d2 > 0) else "未超冠军") + " / " + \
+                  ("超gen3✅" if (t3 > 2 and d3 > 0) else "未超gen3")
+              print(f"{tag:<14} {m:>8.1f} | {d1:>+8.1f} {t1:>+7.2f} | {d2:>+8.1f} {t2:>+7.2f} | {d3:>+8.1f} {t3:>+7.2f} | {v}")
+              lines.append(f"{tag}: mean={m:.1f} d_def={d1:+.1f}(t{t1:+.2f}) d_champ={d2:+.1f}(t{t2:+.2f}) d_gen3={d3:+.1f}(t{t3:+.2f}) {v}")
+
+          nn_avg = sum(means) / len(means)
+          print(f"\nNN 3 种子均值 = {nn_avg:.1f}（距 70000 = {70000 - nn_avg:+.1f}）；gen3 最优参照 = {ref_mean:.1f}")
+          lines.append(f"nn009_mean={nn_avg:.1f} gap_to_70000={70000 - nn_avg:+.1f}; gen3_ref={ref_mean:.1f}")
+          open("SUMMARY.txt", "w").write("\n".join(lines) + "\n")
+          print("SUMMARY.txt 已写盘")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-009b-summary
+          path: SUMMARY.txt
+          retention-days: 30
+          if-no-files-found: error
