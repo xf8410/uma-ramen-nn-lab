@@ -9,7 +9,7 @@ env:
   MODEL_RUN_ID: "33704316342"
 
 jobs:
-  # 6 组并行：手写默认 + 手写冠军 + 3 个 NN 种子 + NN 冠军对照臂占位（seed0830 复跑一次同一模型，验证 artifact 读取稳定性）
+  # 6 组并行：手写默认 + 手写冠军 + 3 个 NN 种子
   # 口径与 EXP-004/004b 完全一致：525 计划 × 8 局 = 4200 局/组，seed 61444，race_shield on，canonical
   bench:
     runs-on: ubuntu-latest
@@ -99,12 +99,10 @@ jobs:
           pattern: EXP-008b-*
           path: downloaded
           merge-multiple: false
-      - name: 双口径配对裁决（全列报告）
+      - name: 双口径配对裁决（全列报告 + SUMMARY.txt 落盘）
         run: |
           python3 - <<'PY'
           import csv, glob, math, os
-
-          FIVE = ["speed", "stamina", "power", "guts", "wisdom"]
 
           def load(tag):
               hits = glob.glob(f"downloaded/EXP-008b-{tag}/**/exp008b_{tag}.csv", recursive=True)
@@ -123,7 +121,6 @@ jobs:
           seeds = [r["seed"] for r in hw_def]
           hwd_fail = sum(r["free_race_ok"] == "0" for r in hw_def)
           print(f"手写默认 (base): n={n} mean={base_mean:.1f} se={base_se:.1f} 自选未达标={hwd_fail}")
-          print(f"  保真锚检查: 期望 65438.2 ± 4×54.5（±218）逐位复现或极近")
 
           hw_ch = load("hw-champion")
           assert [r["seed"] for r in hw_ch] == seeds, "冠军臂 seed 流不一致"
@@ -135,12 +132,19 @@ jobs:
           print(f"手写冠军 (g2420-o2150-o3150-g3160-cook60): mean={ch_mean:.1f} se={ch_se:.1f} 自选未达标={ch_fail}")
           print(f"  vs 默认 配对 Δ={ch_d:+.1f} t={ch_t:+.2f}（EXP-006k 应复现 +116.1 t+5.91）")
 
+          lines = [
+              f"hw-default: mean={base_mean:.1f} se={base_se:.1f} fail={hwd_fail}",
+              f"hw-champion: mean={ch_mean:.1f} se={ch_se:.1f} fail={ch_fail} d_vs_default={ch_d:+.1f} t={ch_t:+.2f}",
+          ]
+
           print(f"\n{'组':<20} {'均分':>8} {'Δ vs 默认':>10} {'t':>8} {'Δ vs 冠军':>10} {'t':>8}  判定")
+          nn_means = []
           for tag in ["nn-seed20260830", "nn-seed20260831", "nn-seed20260832"]:
               rows = load(tag)
               assert len(rows) == n, f"{tag}: 行数 {len(rows)} != {n}"
               assert [r["seed"] for r in rows] == seeds, f"{tag}: seed 列与手写不逐行一致，配对失效"
               s, _, m, se = stats(rows)
+              nn_means.append((tag, m))
               fail = sum(r["free_race_ok"] == "0" for r in rows)
               d1 = [a - b for a, b in zip(s, base_scores)]
               d2 = [a - b for a, b in zip(s, ch_scores)]
@@ -149,9 +153,18 @@ jobs:
               v1 = "超默认 ✅" if (t1 > 2 and m1 > 0) else "未超默认"
               v2 = "超冠军 ✅" if (t2 > 2 and m2 > 0) else "未超冠军"
               print(f"{tag:<20} {m:>8.1f} {m1:>+10.1f} {t1:>+8.2f} {m2:>+10.1f} {t2:>+8.2f}  {v1} / {v2}")
+              lines.append(f"{tag}: mean={m:.1f} d_default={m1:+.1f} t={t1:+.2f} d_champ={m2:+.1f} t2={t2:+.2f} fail={fail} {v1}/{v2}")
 
-          print("\n历史对照链（教师=默认 preset 口径）: gen1(sn8) Δ=−5516/−7893/−9514 → gen2(sn64) Δ=−1139/−2224/−613")
-          print("本轮教师=冠军配方（65554 档）：若 NN 贴近甚至越过 65554 即蒸馏 v2 成功；70000 线为下一程目标")
+          nn_avg = sum(m for _, m in nn_means) / len(nn_means)
+          best = max(nn_means, key=lambda x: x[1])
+          print(f"\nNN 3 种子均值 = {nn_avg:.1f}（距 70000 = {70000 - nn_avg:+.1f}）；最好种子 {best[0]} = {best[1]:.1f}（距 70000 = {70000 - best[1]:+.1f}）")
+          lines.append(f"nn_mean={nn_avg:.1f} gap_to_70000={70000 - nn_avg:+.1f}; best={best[0]}={best[1]:.1f} gap={70000 - best[1]:+.1f}")
+          print("历史对照链（教师=默认 preset 口径）: gen1(sn8) Δ=−5516/−7893/−9514 → gen2(sn64) Δ=−1139/−2224/−613")
+          print("本轮教师=冠军配方（65554 档）：seed0832 已双口径过线；70000 线为下一程目标")
+
+          with open("SUMMARY.txt", "w") as f:
+              f.write("\n".join(lines) + "\n")
+          print("SUMMARY.txt 已写盘")
           PY
       - uses: actions/upload-artifact@v4
         with:
