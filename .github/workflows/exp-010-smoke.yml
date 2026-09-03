@@ -1,0 +1,84 @@
+name: EXP-010 自蒸馏 v4 冒烟（NN 教师 × sn16 × CHUNK=20 × manifest 断言）
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+  # 009b 冠军模型 artifact（run 33744258184 / artifact EXP-009b-nn009-0831）
+  CHAMPION_MODEL_ARTIFACT: EXP-009b-nn009-0831
+  CHAMPION_MODEL_RUN_ID: "33744258184"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          grep -q "$GOT" lab/experiments/UPSTREAM.md || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply 006c→d→e→fix→010 patch 链（教师=NN 评估器）
+        run: |
+          python3 lab/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab/experiments/EXP-006e-power/patch_exp006e_fix.py
+          python3 lab/experiments/EXP-010-selfdistill-v4/patch_exp010.py
+      - name: Patch 自检
+        run: grep -n 'RamenNnTrainer::load' crates/umasim/src/search/searchable.rs
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lab-exp010-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lab-exp010-${{ runner.os }}-
+            lab-exp009-${{ runner.os }}-
+      - name: Download 009b champion model
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.CHAMPION_MODEL_ARTIFACT }}
+          path: models/champion
+          repository: ${{ github.repository }}
+          run-id: ${{ env.CHAMPION_MODEL_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: 模型资产自检
+        run: |
+          ls -la models/champion/
+          test -f models/champion/model.onnx || { echo "model.onnx 缺失"; exit 1; }
+          test -f models/champion/model.onnx.json || { echo "model.onnx.json 旁路缺失"; exit 1; }
+      - name: Smoke（CHUNK=20，断言 manifest）
+        run: |
+          export RAMEN_NN_MODEL="$(pwd)/models/champion/model.onnx"
+          bash lab/experiments/EXP-010-selfdistill-v4/run.sh 0 20
+      - name: Manifest 断言
+        run: |
+          python3 - <<'PY'
+          import json
+          m = json.load(open("experiment_output/shard_0/manifest.json"))
+          assert m["search_n"] == 16, f"search_n={m['search_n']}，应为 16"
+          assert m["index_start"] == 0 and m["index_end"] == 20, f"区间错: [{m['index_start']},{m['index_end']})"
+          assert m["git_commit"] == "d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1", f"git {m['git_commit']}"
+          assert m["finished_at"], "未完成"
+          print("MANIFEST OK:", json.dumps({k: m[k] for k in ("search_n","index_start","index_end","git_commit","accepted","recipe_hash_fnv1a64")}, ensure_ascii=False))
+          PY
+      - name: Upload smoke artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP-010-smoke-shard0
+          path: experiment_output/
+          retention-days: 7
+          if-no-files-found: error
